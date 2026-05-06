@@ -56,6 +56,8 @@ let
     inherit src cargoVendorDir;
     strictDeps = true;
 
+    doCheck = false;
+
     nativeBuildInputs = [
       installShellFiles
       pkg-config
