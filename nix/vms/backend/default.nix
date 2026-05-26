@@ -68,6 +68,12 @@
     security.pam.services.sshd.allowNullPassword = true;
     services = {
       postgresql = {
+        enable = true;
+        ensureDatabases = [ "gradient" ];
+        ensureUsers = [{
+          name = "gradient";
+          ensureDBOwnership = true;
+        }];
         package = pkgs.postgresql_18;
         enableTCPIP = true;
         authentication = ''

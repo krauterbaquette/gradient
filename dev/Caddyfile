@@ -1,0 +1,17 @@
+:3030 {
+
+  handle /api/* {
+    reverse_proxy localhost:3000
+  }
+  handle /cache/* {
+    reverse_proxy localhost:3000
+  }
+  handle /proto {
+    reverse_proxy localhost:3000
+  }
+
+  handle {
+    reverse_proxy localhost:4200
+  }
+
+}

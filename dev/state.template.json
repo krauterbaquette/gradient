@@ -1,0 +1,68 @@
+{
+  "api_keys": {},
+  "integrations": {},
+  "projects": {},
+  "users": {
+    "admin": {
+      "email": "admin@example.com",
+      "email_verified": true,
+      "name": "Admin",
+      "password_file": "DEV_DIR/admin.pwd",
+      "superuser": true,
+      "username": "admin"
+    }
+  },
+  "organizations": {
+    "org": {
+      "created_by": "admin",
+      "description": null,
+      "display_name": "Org",
+      "github_installation_id": null,
+      "hide_build_requests": false,
+      "name": "org",
+      "private_key_file": "DEV_DIR/gradient_org_org_private_key",
+      "public": false
+    }
+  },
+   "caches": {
+    "cache": {
+      "active": true,
+      "created_by": "admin",
+      "description": null,
+      "display_name": "Cache",
+      "local_priority": null,
+      "name": "cache",
+      "organizations": [
+        "org"
+      ],
+      "priority": 10,
+      "public": true,
+      "signing_key_file": "DEV_DIR/gradient_cache_cache_signing_key",
+      "upstreams": [
+        {
+          "cache_name": null,
+          "display_name": "cache.nixos.org",
+          "mode": "ReadWrite",
+          "public_key": "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=",
+          "type": "external",
+          "url": "https://cache.nixos.org"
+        }
+      ]
+    }
+  },
+  "workers": {
+    "local": {
+      "created_by": "admin",
+      "display_name": "local",
+      "enable_build": true,
+      "enable_eval": true,
+      "enable_fetch": true,
+      "organizations": [
+        "org"
+      ],
+      "token_file": "DEV_DIR/worker.token",
+      "url": "ws://127.0.0.1:5050/proto",
+      "worker_id": "WORKER_ID"
+    }
+  }
+}

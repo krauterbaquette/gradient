@@ -58,6 +58,7 @@
         llvmPackages.lld
         lldb
 
+        caddy
         http-server
         nodejs
         pnpm
@@ -75,6 +76,8 @@
         glibc.dev
       ];
 
+      shellHook = pkgs.callPackage ./dev/hook.nix { };
+
       LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
       BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=${glibc.dev}";
 
@@ -86,7 +89,7 @@
 
       GRADIENT_DEBUG = "true";
       GRADIENT_SERVE_URL = "http://localhost:3000";
-      GRADIENT_DATABASE_URL = "postgres://postgres:postgres@localhost:54321/gradient";
+      GRADIENT_DATABASE_URL = "postgres://postgres:postgres@localhost:5432/gradient";
       GRADIENT_MAX_CONCURRENT_EVALUATIONS = 1;
       GRADIENT_MAX_CONCURRENT_BUILDS = 8;
       GRADIENT_STORE_PATH = "./testing/store";
