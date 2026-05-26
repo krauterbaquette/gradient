@@ -29,7 +29,16 @@
   in
   {
     checks = import ./nix/tests { inherit self inputs system pkgs; };
-    apps = import ./nix/vms { inherit inputs system pkgs; };
+    apps = import ./nix/vms { inherit inputs system pkgs; } // {
+      reverseProxy = {
+        type = "app";
+        program = 
+          "${
+            pkgs.writeShellScriptBin "reverseProxy" 
+            "${pkgs.lib.getExe pkgs.caddy} run --adapter caddyfile --config ${./dev/Caddyfile}"
+          }/bin/reverseProxy";
+      };
+    };
     packages = rec {
       store = pkgs.callPackage ./nix/scripts/store.nix { };
       gradient = pkgs.callPackage ./nix/packages/gradient.nix { inherit craneLib; };
@@ -58,7 +67,6 @@
         llvmPackages.lld
         lldb
 
-        caddy
         http-server
         nodejs
         pnpm
