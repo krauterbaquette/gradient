@@ -1,7 +1,12 @@
 {
   "api_keys": {},
   "integrations": {},
-  "projects": {},
+  "projects": {
+    "organization": "org",
+    "created_by": "admin",
+    "wildcard": "packages.x86_64-linux.docs",
+    "repository": "https://github.com/nix-community/bun2nix.git"
+  },
   "users": {
     "admin": {
       "email": "admin@example.com",
@@ -61,7 +66,6 @@
         "org"
       ],
       "token_file": "DEV_DIR/worker.token",
-      "url": "ws://127.0.0.1:5050/proto",
       "worker_id": "WORKER_ID"
     }
   }

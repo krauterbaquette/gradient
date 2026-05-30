@@ -12,11 +12,9 @@
     {
       config,
       lib,
-      pkgs,
       ...
     }:
     {
-      imports = [ ../../modules/gradient.nix ];
       networking.firewall.enable = false;
       documentation.enable = false;
 
@@ -59,24 +57,6 @@
             logging_collector = true;
             log_disconnections = true;
             log_destination = lib.mkForce "syslog";
-          };
-        };
-
-        gradient.worker = {
-          enable = true;
-          serverUrl = "ws://127.0.0.1:3030/proto";
-          workerId = builtins.readFile ../../../dev/worker.id;
-          peersFile = pkgs.writeTextFile {
-            name = "peers-file";
-            # see dev/gradient_worker_<id>_token
-            text = ''
-              *:q2KcAAEPOWyZHAHntvxfw7pnsIncZ68Gx9kDOhT8GyyPVmDp2X+zmbCQIyr9NHRc
-            '';
-          };
-          capabilities = {
-            fetch = true;
-            eval = true;
-            build = true;
           };
         };
 

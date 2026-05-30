@@ -9,7 +9,6 @@
 
   nodes.server =
     {
-      config,
       pkgs,
       lib,
       ...
@@ -32,6 +31,7 @@
         }
       ];
       virtualisation.writableStore = true;
+      virtualisation.memorySize = 8048;
 
       security.pam.services.sshd.allowNullPassword = true;
       services = {
@@ -69,7 +69,7 @@
               projects.bun2nix = {
                 organization = "org";
                 created_by = "admin";
-                wildcard = "packages.x86_64-linux.*";
+                wildcard = "packages.x86_64-linux.docs";
                 repository = "https://github.com/nix-community/bun2nix.git";
               };
               caches.cache = {
@@ -92,6 +92,7 @@
               serverUrl = "ws://127.0.0.1:3000/proto";
               inherit workerId;
               peersFile = toString (pkgs.writeText "peerFile" "*:${workerToken}");
+              settings.maxConcurrentBuilds = 2;
               capabilities = {
                 fetch = true;
                 eval = true;
