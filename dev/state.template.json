@@ -2,10 +2,14 @@
   "api_keys": {},
   "integrations": {},
   "projects": {
-    "organization": "org",
-    "created_by": "admin",
-    "wildcard": "packages.x86_64-linux.docs",
-    "repository": "https://github.com/nix-community/bun2nix.git"
+    "bun2nix": {
+      "display_name": "bun2nix",
+      "name": "bun2nix",
+      "organization": "org",
+      "created_by": "admin",
+      "wildcard": "packages.x86_64-linux.docs",
+      "repository": "https://github.com/nix-community/bun2nix.git"
+    }
   },
   "users": {
     "admin": {
