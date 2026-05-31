@@ -2,13 +2,13 @@
   "api_keys": {},
   "integrations": {},
   "projects": {
-    "bun2nix": {
-      "display_name": "bun2nix",
-      "name": "bun2nix",
+    "gradient": {
+      "display_name": "Gradient",
+      "name": "gradient",
       "organization": "org",
       "created_by": "admin",
-      "wildcard": "packages.x86_64-linux.docs",
-      "repository": "https://github.com/nix-community/bun2nix.git"
+      "wildcard": "packages.x86_64-linux.gradient-frontend",
+      "repository": "https://github.com/wavelens/gradient.git"
     }
   },
   "users": {
