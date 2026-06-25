@@ -11,16 +11,23 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
+    nix = {
+      url = "github:DerDennisOP/nix/feat/eval-metrics-stats";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        nixpkgs-23-11.follows = "nixpkgs";
+        nixpkgs-regression.follows = "nixpkgs";
+      };
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, ... }@inputs: flake-utils.lib.eachDefaultSystem (system: let
+  outputs = { self, nixpkgs, flake-utils, crane, nix, ... }@inputs: flake-utils.lib.eachDefaultSystem (system: let
     pkgs = import nixpkgs {
       inherit system;
       overlays = map (v: self.overlays.${v}) (builtins.attrNames self.overlays);
       config = { allowUnfree = true; };
     };
 
-    nixVersion = pkgs.nixVersions.nix_2_34;
     craneLib = crane.mkLib pkgs;
 
     rustEnv = with pkgs.rustPackages; [
@@ -40,10 +47,15 @@
       };
     };
     packages = rec {
+      inherit (pkgs) gradient-nix;
       store = pkgs.callPackage ./nix/scripts/store.nix { };
       gradient = pkgs.callPackage ./nix/packages/gradient.nix { inherit craneLib; };
       gradient-frontend = pkgs.callPackage ./nix/packages/gradient-frontend.nix { };
-      gradient-cli = pkgs.callPackage ./nix/packages/gradient-cli.nix { inherit craneLib; };
+      gradient-cli = pkgs.callPackage ./nix/packages/gradient-cli.nix {
+        inherit craneLib;
+        cargoFeatures = [ "nix" ];
+      };
+
       default = gradient;
     };
 
@@ -51,7 +63,6 @@
       buildInputs = [
         stdenv.cc.cc.lib
         pam
-        nixVersion
       ];
 
       packages = [
@@ -79,7 +90,7 @@
       ];
 
       nativeBuildInputs = [
-        nixVersion.dev
+        gradient-nix.dev
         pkg-config
         glibc.dev
       ];
@@ -107,10 +118,11 @@
     };
   }) // {
     overlays = {
+      nix = final: prev: { gradient-nix = nix.packages.${final.stdenv.hostPlatform.system}.nix; };
       gradient = final: prev: { inherit (self.packages.${final.stdenv.hostPlatform.system}) gradient; };
       gradient-frontend = final: prev: { inherit (self.packages.${final.stdenv.hostPlatform.system}) gradient-frontend; };
       gradient-cli = final: prev: { inherit (self.packages.${final.stdenv.hostPlatform.system}) gradient-cli; };
-      default = final: prev: { inherit (self.packages.${final.stdenv.hostPlatform.system}) gradient gradient-frontend gradient-cli; };
+      default = final: prev: { inherit (self.packages.${final.stdenv.hostPlatform.system}) gradient gradient-frontend gradient-cli gradient-nix; };
     };
 
     nixosModules = rec {

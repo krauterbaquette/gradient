@@ -31,9 +31,6 @@ pub struct MakeWorkerRequest {
     pub display_name: String,
     pub url: Option<String>,
     pub token: Option<String>,
-    pub enable_fetch: Option<bool>,
-    pub enable_eval: Option<bool>,
-    pub enable_build: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -80,18 +77,6 @@ impl WorkersApi<'_> {
             true,
         )?
         .json(&body);
-        http::decode(req.send().await?).await
-    }
-
-    pub async fn get(&self, org: &str, worker_id: &str) -> Result<Worker, ConnectorError> {
-        let req = http::request(
-            self.0.http(),
-            self.0.base_url(),
-            self.0.token(),
-            Method::GET,
-            &format!("orgs/{org}/workers/{worker_id}"),
-            true,
-        )?;
         http::decode(req.send().await?).await
     }
 

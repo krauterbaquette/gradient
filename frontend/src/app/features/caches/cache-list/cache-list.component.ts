@@ -18,6 +18,7 @@ import { CachesService } from '@core/services/caches.service';
 import { AuthService } from '@core/services/auth.service';
 import { LoadingSpinnerComponent } from '@shared/components/loading-spinner/loading-spinner.component';
 import { EmptyStateComponent } from '@shared/components/empty-state/empty-state.component';
+import { slugify } from '@shared/text';
 import { Cache } from '@core/models';
 
 @Component({
@@ -69,11 +70,6 @@ export class CacheListComponent implements OnInit, OnDestroy {
 
   publicCaches = signal<Cache[]>([]);
   publicLoading = signal(false);
-
-  get priorityInvalid(): boolean {
-    const p = this.newCache.priority;
-    return p === null || p === undefined || isNaN(Number(p)) || p < 0 || p > 255;
-  }
 
   ngOnInit(): void {
     if (this.authService.isAuthenticated()) {
@@ -129,7 +125,7 @@ export class CacheListComponent implements OnInit, OnDestroy {
 
   onCacheDisplayNameChange(value: string): void {
     if (!this.cacheNameEditedByUser) {
-      const slug = this.toSlug(value);
+      const slug = slugify(value);
       this.newCache.name = slug;
       this.onCacheNameChange(slug);
     }
@@ -137,13 +133,6 @@ export class CacheListComponent implements OnInit, OnDestroy {
 
   onCacheNameUserInput(): void {
     this.cacheNameEditedByUser = true;
-  }
-
-  private toSlug(text: string): string {
-    return text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '');
   }
 
   onCacheNameChange(name: string): void {

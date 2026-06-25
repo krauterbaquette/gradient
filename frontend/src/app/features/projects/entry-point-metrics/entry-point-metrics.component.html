@@ -17,6 +17,10 @@
       <h1>{{ evalAttr() }}</h1>
       <p class="text-secondary">Build history over the last {{ keepEvaluations() }} completed evaluations.</p>
     </div>
+    @if (latestBuildId()) {
+      <button pButton label="View Closure" icon="pi pi-sitemap" severity="secondary"
+         [routerLink]="['/organization', orgName, 'closure', 'build', latestBuildId()]"></button>
+    }
   </div>
 
   @if (loading()) {

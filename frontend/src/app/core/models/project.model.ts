@@ -30,18 +30,34 @@ export interface Project {
   can_trigger: boolean;
 }
 
+export interface BuildStatusCounts {
+  completed: number;
+  failed: number;
+  building: number;
+  queued: number;
+  substituted: number;
+  aborted: number;
+}
+
+export interface QueueSummary {
+  building: number;
+  queued: number;
+}
+
 export interface EvaluationSummary {
   id: string;
   commit: string;
+  commit_message: string | null;
   status: EvaluationStatus;
+  trigger: { id: string; type: TriggerType } | null;
+  triggered_by: string | null;
+  pr_number: number | null;
   total_builds: number;
-  failed_builds: number;
-  completed_entry_points: number;
-  failed_entry_points: number;
-  entry_point_diff: number | null;
+  builds: BuildStatusCounts;
+  errors: number;
+  warnings: number;
   created_at: string;
   updated_at: string;
-  trigger: { id: string; type: TriggerType } | null;
 }
 
 export interface EntryPointSummary {
@@ -52,8 +68,9 @@ export interface EntryPointSummary {
   build_status: BuildStatus;
   has_artefacts: boolean;
   architecture: Architecture;
-  evaluation_id: string;
-  evaluation_status: EvaluationStatus;
+  build_time_ms: number | null;
+  deps: BuildStatusCounts;
+  deps_total: number | null;
   created_at: string;
 }
 
@@ -68,6 +85,8 @@ export interface ProjectDetail {
   created_at: string;
   keep_evaluations: number;
   last_evaluations: EvaluationSummary[];
+  last_check_at: string | null;
+  queue: QueueSummary;
   can_edit: boolean;
   can_trigger: boolean;
   managed: boolean;
@@ -101,13 +120,27 @@ export interface Evaluation {
   trigger: { id: string; type: TriggerType } | null;
 }
 
-export type WaitingReason = WorkersWaitingReason | ApprovalWaitingReason | NoCacheWaitingReason;
+export type WaitingReason =
+  | WorkersWaitingReason
+  | EvalWorkersWaitingReason
+  | ApprovalWaitingReason
+  | NoCacheWaitingReason
+  | CacheStorageFullWaitingReason
+  | GraphStuckWaitingReason;
 
 export interface WorkersWaitingReason {
   kind: 'workers';
   unmet: UnmetRequirement[];
   connected_workers: number;
   available_architectures: string[];
+}
+
+export type EvalCapability = 'fetch' | 'eval';
+
+export interface EvalWorkersWaitingReason {
+  kind: 'eval_workers';
+  capability: EvalCapability;
+  connected_workers: number;
 }
 
 export interface ApprovalWaitingReason {
@@ -118,6 +151,15 @@ export interface ApprovalWaitingReason {
 
 export interface NoCacheWaitingReason {
   kind: 'no_cache';
+}
+
+export interface CacheStorageFullWaitingReason {
+  kind: 'cache_storage_full';
+}
+
+export interface GraphStuckWaitingReason {
+  kind: 'graph_stuck';
+  pending_anchors: number;
 }
 
 export interface UnmetRequirement {

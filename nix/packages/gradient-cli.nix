@@ -8,18 +8,36 @@
 , craneLib
 , git
 , installShellFiles
-, nixVersions
+, gradient-nix
 , openssl
 , pkg-config
 , stdenv
+, cargoFeatures ? [ ]
 }:
 let
-  nixVersion = nixVersions.nix_2_34;
-
   src = craneLib.cleanCargoSource ../../cli;
 
-  commonArgs = {
+  # harmonia (git dep) ships crates whose Cargo.toml points at a README.md that
+  # isn't in the crate dir; strip the readme key so vendoring doesn't choke.
+  cargoVendorDir = craneLib.vendorCargoDeps {
     inherit src;
+    overrideVendorGitCheckout = _ps: drv:
+      drv.overrideAttrs (old: {
+        postPatch = (old.postPatch or "") + ''
+          find . -name "Cargo.toml" | xargs sed -i '/^readme\s*=/d'
+        '';
+      });
+  };
+
+  # Crane has no easy way to set Cargo features, this sets them manually via cargoExtraArgs.
+  # It has `--locked` hard coded since that is the default of Crane.
+  cargoExtraArgs = lib.concatStringsSep " " (
+    [ "--locked" ]
+    ++ lib.optional (cargoFeatures != [ ]) "--features ${lib.concatStringsSep "," cargoFeatures}"
+  );
+
+  commonArgs = {
+    inherit src cargoExtraArgs cargoVendorDir;
     strictDeps = true;
 
     nativeBuildInputs = [
@@ -29,12 +47,12 @@ let
 
     buildInputs = [
       git
-      nixVersion
+      gradient-nix
       openssl
     ];
   };
 
-  # Cached dependency layer - only rebuilt when Cargo.lock changes
+  # Cached dependency layer - only rebuilt when Cargo.lock or features change
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 in
 craneLib.buildPackage (commonArgs // {

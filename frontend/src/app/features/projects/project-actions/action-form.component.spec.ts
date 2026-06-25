@@ -85,6 +85,27 @@ describe('ActionFormComponent', () => {
     expect(v.length).toBeGreaterThan(20);
   });
 
+  it('sends empty events for forge_status_report', () => {
+    const fixture = createFixture(true);
+    fixture.detectChanges();
+    const c = fixture.componentInstance;
+    c.type.set('forge_status_report');
+    c.integrationId.set('int-1');
+    c.name.set('report');
+    let emitted: any;
+    c.saved.subscribe((r) => (emitted = r));
+    c.onSubmit();
+    expect(emitted.events).toEqual([]);
+  });
+
+  it('renders the submit error inside the dialog', () => {
+    const fixture = createFixture(true);
+    fixture.componentRef.setInput('open', true);
+    fixture.componentRef.setInput('error', 'Integration not found');
+    fixture.detectChanges();
+    expect((fixture.nativeElement as HTMLElement).textContent).toContain('Integration not found');
+  });
+
   it('emits a CreateActionRequest with the correct discriminated union on submit', () => {
     const fixture = createFixture(true);
     fixture.detectChanges();

@@ -12,6 +12,8 @@
         <span class="breadcrumb-separator">/</span>
         <a [routerLink]="['/organization', orgName, 'project', projectName]" class="breadcrumb-link">{{ projectName }}</a>
         <span class="breadcrumb-separator">/</span>
+        <a [routerLink]="['/organization', orgName, 'project', projectName, 'settings']" class="breadcrumb-link">Settings</a>
+        <span class="breadcrumb-separator">/</span>
         <span class="breadcrumb-current">Actions</span>
       </div>
       <h1>Actions</h1>
@@ -90,14 +92,14 @@
               </div>
               <div class="action-actions">
                 <button
-                  *appWritable="access()"
+                  *appWritable="triggerAccess()"
                   pButton
                   label="Test"
                   icon="pi pi-play"
                   severity="secondary"
                   size="small"
                   [loading]="testingId() === action.id"
-                  [disabled]="rowDisabled()"
+                  [disabled]="triggerRowDisabled()"
                   (click)="testAction(action.id)"
                 ></button>
                 <button
@@ -141,6 +143,7 @@
 <app-action-form
   mode="create"
   [open]="showCreateDialog()"
+  [error]="error()"
   [outboundIntegrations]="outboundIntegrations()"
   (saved)="onCreateSaved($event)"
   (closed)="showCreateDialog.set(false)"
@@ -149,6 +152,7 @@
 <app-action-form
   mode="edit"
   [open]="showEditDialog()"
+  [error]="error()"
   [existing]="editingAction()"
   [outboundIntegrations]="outboundIntegrations()"
   (saved)="onEditSaved($event)"

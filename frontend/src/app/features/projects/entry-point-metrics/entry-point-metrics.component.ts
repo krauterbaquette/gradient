@@ -19,6 +19,7 @@ import {
   ApexDataLabels,
   ApexMarkers,
 } from 'ng-apexcharts';
+import { ButtonModule } from 'primeng/button';
 import { ProjectsService, EntryPointMetricPoint, EntryPointMetricsResponse } from '@core/services/projects.service';
 import { OrganizationsService } from '@core/services/organizations.service';
 import { LoadingSpinnerComponent } from '@shared/components/loading-spinner/loading-spinner.component';
@@ -27,6 +28,7 @@ const CHART_COLORS = {
   buildTime: '#17a2b8',
   outputSize: '#28a745',
   closureSize: '#fd7e14',
+  runtimeClosure: '#20c997',
   deps: '#e83e8c',
   background: '#21262d',
   border: '#2d333b',
@@ -52,7 +54,7 @@ type ChartOptions = {
 @Component({
   selector: 'app-entry-point-metrics',
   standalone: true,
-  imports: [CommonModule, RouterModule, NgApexchartsModule, LoadingSpinnerComponent],
+  imports: [CommonModule, RouterModule, ButtonModule, NgApexchartsModule, LoadingSpinnerComponent],
   templateUrl: './entry-point-metrics.component.html',
   styleUrl: './entry-point-metrics.component.scss',
 })
@@ -106,7 +108,7 @@ export class EntryPointMetricsComponent implements OnInit {
         background: CHART_COLORS.background,
         toolbar: { show: false },
         animations: { enabled: true, speed: 400 },
-        zoom: { enabled: false },
+        zoom: { enabled: false, allowMouseWheelZoom: false },
       },
       theme: { mode: 'dark' },
       stroke: { curve: 'smooth', width: 2 },
@@ -151,7 +153,11 @@ export class EntryPointMetricsComponent implements OnInit {
   closureSizeChart = computed<ChartOptions>(() => {
     const pts = this.points();
     const opts = this.baseChart(CHART_COLORS.closureSize);
-    opts.series = [{ name: 'Closure size', data: pts.map((p) => p.closure_size_bytes) }];
+    opts.colors = [CHART_COLORS.closureSize, CHART_COLORS.runtimeClosure];
+    opts.series = [
+      { name: 'Build closure', data: pts.map((p) => p.closure_size_bytes) },
+      { name: 'Runtime closure', data: pts.map((p) => p.runtime_closure_size_bytes) },
+    ];
     opts.yaxis = { ...opts.yaxis, labels: { style: { colors: CHART_COLORS.text }, formatter: (v: number) => this.formatBytes(v) } };
     opts.tooltip = { theme: 'dark', y: { formatter: (v: number) => this.formatBytes(v) } };
     return opts;
@@ -166,8 +172,13 @@ export class EntryPointMetricsComponent implements OnInit {
     return opts;
   });
 
+  latestBuildId = computed(() => {
+    const pts = this.points();
+    return pts.length ? pts[pts.length - 1].build_id : '';
+  });
+
   completedCount = computed(() => this.points().filter((p) => p.build_status === 'Completed').length);
-  failedCount = computed(() => this.points().filter((p) => p.build_status === 'Failed').length);
+  failedCount = computed(() => this.points().filter((p) => p.build_status === 'FailedPermanent' || p.build_status === 'FailedTimeout').length);
   substitutedCount = computed(() => this.points().filter((p) => p.build_status === 'Substituted').length);
 
   formatBytes(bytes: number): string {

@@ -11,7 +11,9 @@ import { DialogModule } from 'primeng/dialog';
 import { ButtonModule } from 'primeng/button';
 import { InputTextModule } from 'primeng/inputtext';
 import { SelectModule } from 'primeng/select';
+import { SelectButtonModule } from 'primeng/selectbutton';
 import { CheckboxModule } from 'primeng/checkbox';
+import { TextareaModule } from 'primeng/textarea';
 import { ConfigService } from '@core/services/config.service';
 import {
   Action,
@@ -19,6 +21,9 @@ import {
   ActionType,
   CreateActionRequest,
   FORGE_STATUS_EVENTS,
+  PrGenerator,
+  PrGranularity,
+  PrVerifyGate,
   UpdateActionRequest,
 } from '@core/models';
 import { ActionEventsComponent } from './action-events.component';
@@ -40,7 +45,9 @@ interface IntegrationOption {
     ButtonModule,
     InputTextModule,
     SelectModule,
+    SelectButtonModule,
     CheckboxModule,
+    TextareaModule,
     ActionEventsComponent,
   ],
   templateUrl: './action-form.component.html',
@@ -53,6 +60,7 @@ export class ActionFormComponent implements OnChanges {
   existing = input<Action | null>(null);
   outboundIntegrations = input<IntegrationOption[]>([]);
   open = input<boolean>(false);
+  error = input<string | null>(null);
 
   saved = output<CreateActionRequest | UpdateActionRequest>();
   closed = output<void>();
@@ -67,6 +75,28 @@ export class ActionFormComponent implements OnChanges {
   url = signal('');
   tokenValue = signal('');
   integrationId = signal('');
+  prGenerator = signal<PrGenerator>('flake_lock');
+  prGranularity = signal<PrGranularity>('per_run');
+  prVerifyGate = signal<PrVerifyGate>('build');
+  prBranchPattern = signal('gradient/flake-lock-update');
+  prTitleTemplate = signal('');
+  prBodyTemplate = signal('');
+  prUpdateExisting = signal(true);
+
+  readonly generatorOptions: { label: string; value: PrGenerator }[] = [
+    { label: 'Flake Lock', value: 'flake_lock' },
+  ];
+
+  readonly granularityOptions: { label: string; value: PrGranularity }[] = [
+    { label: 'Per Run', value: 'per_run' },
+    { label: 'Per Input', value: 'per_input' },
+  ];
+
+  readonly verifyGateOptions: { label: string; value: PrVerifyGate }[] = [
+    { label: 'None', value: 'none' },
+    { label: 'Eval', value: 'eval' },
+    { label: 'Build', value: 'build' },
+  ];
 
   readonly smtpEnabled = computed(() => this.config.smtpEnabled);
 
@@ -75,6 +105,7 @@ export class ActionFormComponent implements OnChanges {
     if (this.smtpEnabled()) opts.push({ label: 'Send Mail', value: 'send_mail' });
     opts.push({ label: 'Send Web Request', value: 'send_web_request' });
     opts.push({ label: 'Forge Status Report', value: 'forge_status_report' });
+    opts.push({ label: 'Open PR', value: 'open_pr' });
     return opts;
   });
 
@@ -112,7 +143,18 @@ export class ActionFormComponent implements OnChanges {
       this.url.set('');
       this.tokenValue.set('');
       this.integrationId.set('');
+      this.resetPrFields();
     }
+  }
+
+  private resetPrFields(): void {
+    this.prGenerator.set('flake_lock');
+    this.prGranularity.set('per_run');
+    this.prVerifyGate.set('build');
+    this.prBranchPattern.set('gradient/flake-lock-update');
+    this.prTitleTemplate.set('');
+    this.prBodyTemplate.set('');
+    this.prUpdateExisting.set(true);
   }
 
   private applyConfigToForm(cfg: ActionConfig): void {
@@ -127,6 +169,16 @@ export class ActionFormComponent implements OnChanges {
       case 'forge_status_report':
         this.integrationId.set(cfg.integration_id);
         break;
+      case 'open_pr':
+        this.integrationId.set(cfg.integration_id);
+        this.prGenerator.set(cfg.generator);
+        this.prGranularity.set(cfg.granularity);
+        this.prVerifyGate.set(cfg.verify_gate);
+        this.prBranchPattern.set(cfg.branch_pattern);
+        this.prTitleTemplate.set(cfg.title_template ?? '');
+        this.prBodyTemplate.set(cfg.body_template ?? '');
+        this.prUpdateExisting.set(cfg.update_existing);
+        break;
     }
   }
 
@@ -137,6 +189,7 @@ export class ActionFormComponent implements OnChanges {
     this.url.set('');
     this.tokenValue.set('');
     this.integrationId.set('');
+    this.resetPrFields();
     if (newType === 'forge_status_report') this.events.set([...FORGE_STATUS_EVENTS]);
   }
 
@@ -173,13 +226,29 @@ export class ActionFormComponent implements OnChanges {
       }
       case 'forge_status_report':
         return { type: 'forge_status_report', integration_id: this.integrationId() };
+      case 'open_pr': {
+        const cfg: Extract<ActionConfig, { type: 'open_pr' }> = {
+          type: 'open_pr',
+          integration_id: this.integrationId(),
+          generator: this.prGenerator(),
+          granularity: this.prGranularity(),
+          verify_gate: this.prVerifyGate(),
+          branch_pattern: this.prBranchPattern().trim(),
+          update_existing: this.prUpdateExisting(),
+        };
+        const title = this.prTitleTemplate().trim();
+        const body = this.prBodyTemplate().trim();
+        if (title) cfg.title_template = title;
+        if (body) cfg.body_template = body;
+        return cfg;
+      }
     }
   }
 
   onSubmit(): void {
     const config = this.buildConfig();
     const events =
-      this.type() === 'forge_status_report' ? [...FORGE_STATUS_EVENTS] : this.events();
+      this.type() === 'forge_status_report' ? [] : this.events();
     if (this.mode() === 'create') {
       const req: CreateActionRequest = {
         name: this.name().trim(),

@@ -1,0 +1,99 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Wavelens GmbH <info@wavelens.io>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+pub mod actions;
+pub mod artefacts;
+pub mod log;
+pub mod query;
+pub mod types;
+
+pub use self::actions::*;
+pub use self::artefacts::*;
+pub use self::log::*;
+pub use self::query::*;
+pub use self::types::*;
+
+use crate::access::is_org_member;
+use crate::authorization::ApiKeyContext;
+use crate::error::{WebError, WebResult};
+use crate::helpers::OptionExt;
+use gradient_types::*;
+use gradient_core::ServerState;
+use sea_orm::EntityTrait;
+use std::sync::Arc;
+
+/// Resolved access context for an evaluation.
+///
+/// Loaded once per request: fetches the evaluation row, resolves the owning
+/// organization through the project, and enforces the access check. Returns
+/// `not_found("Evaluation")` on any failure so callers cannot distinguish
+/// missing from forbidden.
+pub(super) struct EvalAccessContext {
+    pub evaluation: MEvaluation,
+    pub organization_id: OrganizationId,
+    pub project_name: Option<String>,
+    pub project_display_name: Option<String>,
+}
+
+impl EvalAccessContext {
+    pub(super) async fn load(
+        state: &Arc<ServerState>,
+        evaluation_id: EvaluationId,
+        maybe_user: &Option<MUser>,
+        api_key: Option<&ApiKeyContext>,
+    ) -> WebResult<Self> {
+        let evaluation = EEvaluation::find_by_id(evaluation_id)
+            .one(&state.web_db)
+            .await?
+            .or_not_found("Evaluation")?;
+
+        let project_id = evaluation.project.ok_or_else(|| {
+            tracing::warn!(%evaluation_id, "evaluation has no project");
+            WebError::data_inconsistency("Evaluation")
+        })?;
+        let project = EProject::find_by_id(project_id)
+            .one(&state.web_db)
+            .await?
+            .ok_or_else(|| {
+                tracing::warn!(
+                    %project_id,
+                    %evaluation_id,
+                    "Project not found for evaluation",
+                );
+                WebError::data_inconsistency("Evaluation")
+            })?;
+        let organization_id = project.organization;
+        let project_name = Some(project.name);
+        let project_display_name = Some(project.display_name);
+
+        let organization = EOrganization::find_by_id(organization_id)
+            .one(&state.web_db)
+            .await?
+            .ok_or_else(|| {
+                tracing::warn!(%organization_id, "Organization not found");
+                WebError::data_inconsistency("Organization")
+            })?;
+
+        let can_access = if organization.public {
+            true
+        } else {
+            match maybe_user {
+                Some(user) => is_org_member(state, user.id, organization.id, api_key).await?,
+                None => false,
+            }
+        };
+        if !can_access {
+            return Err(WebError::not_found("Evaluation"));
+        }
+
+        Ok(Self {
+            evaluation,
+            organization_id,
+            project_name,
+            project_display_name,
+        })
+    }
+}

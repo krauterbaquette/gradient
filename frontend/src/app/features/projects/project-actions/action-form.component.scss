@@ -24,26 +24,26 @@
   }
 }
 
-.radio-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: $spacing-md;
-}
-
-.radio-option {
-  display: inline-flex;
-  align-items: center;
-  gap: $spacing-xs;
-  font-weight: normal;
-  margin-bottom: 0;
-}
-
 .token-row {
   display: flex;
   gap: $spacing-sm;
   align-items: center;
 
   input { flex: 1; }
+}
+
+.dialog-error {
+  display: flex;
+  align-items: center;
+  gap: $spacing-sm;
+  background: rgba($color-danger, 0.1);
+  border: 1px solid rgba($color-danger, 0.5);
+  border-radius: $border-radius-md;
+  padding: $spacing-md;
+  color: $color-danger;
+  margin-bottom: $spacing-md;
+
+  .material-symbols-outlined { font-size: 20px; }
 }
 
 .w-full { width: 100%; }

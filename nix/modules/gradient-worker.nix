@@ -13,10 +13,10 @@ in {
     packages = {
       gradient = lib.mkPackageOption pkgs "gradient" { };
       nix = lib.mkOption {
-        default = config.nix.package;
-        defaultText = lib.literalExpression "config.nix.package";
+        default = pkgs.gradient-nix;
+        defaultText = lib.literalExpression "pkgs.gradient-nix";
         type = lib.types.package;
-        description = "Nix package to use for evaluation and fetching. The `nix` binary from this package is passed to the worker as `GRADIENT_BINPATH_NIX`.";
+        description = "Nix package to use for evaluation and fetching. The `nix` binary from this package is passed to the worker as `GRADIENT_BINPATH_NIX`. Defaults to the gradient nix fork so the shelled-out `nix` matches the worker's embedded fork evaluator.";
       };
 
       git = lib.mkOption {
@@ -52,7 +52,7 @@ in {
         extraConfig = lib.mkOption {
           description = ''
             Additional lines of configuration passed to
-            `services.caddy.virtualHosts.<name>.extraConfig` 
+            `services.caddy.virtualHosts.<name>.extraConfig`
             after the reverse proxy setup.
           '';
           type = lib.types.lines;
@@ -62,7 +62,7 @@ in {
     };
 
     useTls = lib.mkEnableOption "TLS" // { default = true; };
-    discoverable = lib.mkEnableOption "accept incoming connections on /proto";
+    discoverable = lib.mkEnableOption "incoming connections on `/proto`";
     domain = lib.mkOption {
       description = "Domain under which the worker's nginx vhost is served. Only used when a reverseProxy is enabled";
       type = lib.types.str;
@@ -97,16 +97,11 @@ in {
 
     workerId = lib.mkOption {
       description = ''
-        Override the worker's persistent UUID. When set, this value is used as
-        the worker identity instead of the UUID auto-generated and stored in
-        <literal>$StateDirectory/worker-id</literal> on first start.
-
-        Useful for declarative deployments where the worker UUID must be known
-        ahead of time (e.g. to pre-register it in <literal>state.workers</literal>).
-        Must be a valid UUID.
-
-        When null (default) the worker reads or generates its ID from the state
-        directory as usual.
+        Override the worker's persistent UUID. When set, this UUID is used as
+        the worker identity instead of the one auto-generated and stored in
+        `$StateDirectory/worker-id` on first start. Useful for declarative
+        deployments that must know the worker UUID ahead of time (e.g. to
+        pre-register it in `state.workers`).
       '';
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -115,41 +110,41 @@ in {
 
     peersFile = lib.mkOption {
       description = ''
-        Path to a file containing peer-to-token pairs for challenge-response
-        auth with the Gradient server, one entry per line:
+        Path to a file of peer-to-token pairs for challenge-response auth with
+        the Gradient server, one `peer_id:token` per line (lines starting with
+        `#` are ignored):
 
-        <literal>
-        # one peer_id:token per line; lines starting with # are ignored
-        &lt;uuid&gt;:&lt;token&gt;
-        *:&lt;token&gt;
-        </literal>
+        ```
+        <uuid>:<token>
+        *:<token>
+        ```
 
-        The special peer ID <literal>*</literal> matches any UUID the server
-        challenges, so a single token works for any org. Each token must be
-        a 48-byte random secret (e.g. <literal>openssl rand -base64 48</literal>)
-        and is registered via <literal>POST /api/v1/orgs/{org}/workers</literal>.
+        The special peer ID `*` matches any UUID the server challenges, so a
+        single token works for any org. Each token is a 48-byte random secret
+        (e.g. `openssl rand -base64 48`) registered via
+        `POST /api/v1/orgs/{org}/workers`. Pin the org UUID with
+        `services.gradient.state.organizations.<name>.id` to reference it here.
 
-        When null (default), the worker connects in open/discoverable mode -
-        the server accepts the connection without token validation. Suitable
-        for local co-located workers.
+        When null (default), the worker connects in open/discoverable mode and
+        the server accepts it without token validation.
       '';
       type = lib.types.nullOr lib.types.path;
       default = null;
     };
 
     capabilities = {
-      federate = lib.mkEnableOption "federate capability - relay work and NAR traffic between workers and servers (requires discoverable)";
-      fetch = lib.mkEnableOption "fetch capability - prefetch flake inputs and sources" // { default = true; };
-      eval  = lib.mkEnableOption "eval capability - run Nix flake evaluations" // { default = true; };
-      build = lib.mkEnableOption "build capability - execute Nix store builds" // { default = true; };
+      federate = lib.mkEnableOption "the federate capability (relay work and NAR traffic between workers and servers; requires discoverable)";
+      fetch = lib.mkEnableOption "the fetch capability (prefetch flake inputs and sources)" // { default = true; };
+      eval  = lib.mkEnableOption "the eval capability (run Nix flake evaluations)" // { default = true; };
+      build = lib.mkEnableOption "the build capability (execute Nix store builds)" // { default = true; };
     };
 
     settings = {
       architectures = lib.mkOption {
         description = "Nix system strings this worker can build for";
         type = lib.types.listOf lib.types.str;
-        default = [ pkgs.stdenv.hostPlatform.system ];
-        defaultText = lib.literalExpression "[ pkgs.system ]";
+        default = [ pkgs.stdenv.hostPlatform.system ] ++ lib.optional (pkgs.stdenv.hostPlatform.system == "x86_64-linux") "i686-linux";
+        defaultText = lib.literalExpression ''[ pkgs.stdenv.hostPlatform.system ] ++ lib.optional (pkgs.stdenv.hostPlatform.system == "x86_64-linux") "i686-linux"'';
         example = [ "x86_64-linux" "aarch64-linux" ];
       };
 
@@ -159,6 +154,12 @@ in {
         default = lib.lists.uniqueStrings config.nix.settings.system-features;
         defaultText = lib.literalExpression "lib.lists.uniqueStrings config.nix.settings.system-features";
         example = [ "nixos-test" "benchmark" "big-parallel" ];
+      };
+
+      cpuCoreScore = lib.mkOption {
+        description = "Override the advertised single-core speed score (higher is faster). When null, the worker benchmarks the host at startup.";
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
       };
 
       maxConcurrentEvaluations = lib.mkOption {
@@ -184,19 +185,52 @@ in {
         default = 32;
       };
 
+      narPartialTtlSecs = lib.mkOption {
+        description = ''
+          TTL in seconds for partially-received NAR downloads (`*.partial`)
+          staged under `<baseDir>/nar-partial`. A periodic sweep deletes
+          partials whose last write is older than this so an abandoned
+          resumable transfer can't pin disk forever (issue #225). Set to 0
+          to disable the sweep.
+        '';
+        type = lib.types.ints.unsigned;
+        default = 86400;
+      };
+
       evalWorkers = lib.mkOption {
         description = "Number of Nix evaluator subprocesses";
         type = lib.types.ints.positive;
         default = 8;
       };
 
-      maxEvaluationsPerWorker = lib.mkOption {
-        description = ''
-          Recycle an eval-worker subprocess after it has served this many
-          list/resolve calls. Set to 0 to disable recycling.
-        '';
-        type = lib.types.ints.unsigned;
-        default = 1;
+      evalForkWorkers = lib.mkOption {
+        description = "Number of parallel eval subprocesses in the pool (the eval concurrency). When null, the worker auto-sizes to the host core count (capped). Each worker may hold up to maxEvalRss of resident memory.";
+        type = lib.types.nullOr lib.types.ints.positive;
+        default = null;
+      };
+
+      maxEvalRss = lib.mkOption {
+        description = "Safety cap on an eval subprocess's resident memory: once its RSS exceeds this many bytes it is recycled (parent-side). Keep it above a typical eval's heap so warm workers are not recycled mid-evaluation.";
+        type = lib.types.ints.positive;
+        default = 8589934592;
+      };
+
+      evalCacheDir = lib.mkOption {
+        description = "Eval-cache directory exported to eval workers as NIX_CACHE_HOME. When null, resolves to {baseDir}/eval-cache.";
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+      };
+
+      evalCacheShare = lib.mkOption {
+        description = "Enable fleet eval-cache sharing (pull/push of <fingerprint>.sqlite blobs across workers).";
+        type = lib.types.bool;
+        default = true;
+      };
+
+      evalMetricsEnabled = lib.mkOption {
+        description = "Capture per-evaluation Nix metrics (thunks, heap, peak RSS, per-entry-point hotspots, flake graph). When false, eval-workers skip the stats read (zero overhead).";
+        type = lib.types.bool;
+        default = true;
       };
 
       maxProtoConnections = lib.mkOption {
@@ -207,19 +241,75 @@ in {
 
       gcrootsDir = lib.mkOption {
         description = ''
-          Directory under which the worker writes one indirect GC root
-          symlink per active build (drv + outputs). Pins inputs and
-          just-built outputs through the local nix-daemon so a concurrent
-          <literal>nix-collect-garbage</literal> cannot delete them
-          mid-build. A systemd-tmpfiles rule creates the directory under
-          the worker user and adds it to the unit's
-          <literal>ReadWritePaths</literal>.
-
-          Set to an empty string to disable GC root pinning (the worker
-          still builds, but a concurrent GC may race the build).
+          Directory under which the worker writes one indirect GC root symlink
+          per active build (drv + outputs), pinning inputs and just-built
+          outputs so a concurrent `nix-collect-garbage` cannot delete them
+          mid-build. Set to an empty string to disable pinning (the worker
+          still builds, but a concurrent GC may race it).
         '';
         type = lib.types.str;
         default = "/nix/var/nix/gcroots/gradient";
+      };
+
+      buildMetrics = lib.mkOption {
+        description = ''
+          Capture per-build resource metrics (peak RAM, CPU time, disk I/O) by
+          enabling Nix's experimental `cgroups` feature and `use-cgroups` on the
+          daemon, and delegating the cgroup-v2 controllers to `nix-daemon.service`
+          (`Delegate=yes`) so per-build `memory.peak`/`io.stat` are exposed. CPU
+          time comes from the daemon build result; peak RAM and disk I/O are
+          sampled live from the build's cgroup (located via `buildCgroupStateDir`),
+          reliable at concurrency 1 and best-effort above. Wall-clock build time
+          is always reported.
+        '';
+        type = lib.types.bool;
+        default = false;
+      };
+
+      buildCgroupRoot = lib.mkOption {
+        description = "Cgroup-v2 mount root searched for per-build cgroups when `buildMetrics` is enabled.";
+        type = lib.types.str;
+        default = "/sys/fs/cgroup";
+      };
+
+      buildCgroupStateDir = lib.mkOption {
+        description = ''
+          Nix's `<nix-state-dir>/cgroups` directory, where the daemon records
+          each build's cgroup path (`<uid>` files). The worker reads the newest
+          entry to locate a running build's cgroup for metrics. Granted read
+          access via `ReadOnlyPaths`.
+        '';
+        type = lib.types.str;
+        default = "/nix/var/nix/cgroups";
+      };
+
+      logBurstBytesPerMin = lib.mkOption {
+        description = ''
+          Burst token bucket: maximum build-log bytes forwarded to the server
+          per build in any 1-minute window. On trip the worker stops forwarding
+          log output for that build (the build still runs). Default 8 MiB.
+        '';
+        type = lib.types.int;
+        default = 8 * 1024 * 1024;
+      };
+
+      logSustainedBytesPerHour = lib.mkOption {
+        description = ''
+          Sustained token bucket: maximum build-log bytes forwarded to the
+          server per build in any 1-hour window. Default 64 MiB.
+        '';
+        type = lib.types.int;
+        default = 64 * 1024 * 1024;
+      };
+
+      logFetchFromStore = lib.mkOption {
+        description = ''
+          When a derivation is already built in the local store (so the daemon
+          produces no fresh log), read nix's stored `.bz2` build log and forward
+          it so the UI still shows output.
+        '';
+        type = lib.types.bool;
+        default = true;
       };
 
       logLevel = lib.mkOption {
@@ -281,6 +371,11 @@ in {
         };
       };
 
+      # Delegate cgroup-v2 controllers so per-build cgroups expose memory.peak / io.stat.
+      services.nix-daemon = lib.mkIf cfg.settings.buildMetrics {
+        serviceConfig.Delegate = true;
+      };
+
       services.gradient-worker = {
         wantedBy = [ "multi-user.target" ];
         after = [ "network.target" ];
@@ -304,10 +399,18 @@ in {
           ProtectProc = "invisible";
           ProtectSystem = "strict";
           ReadWritePaths = lib.optionals (cfg.settings.gcrootsDir != "") [ cfg.settings.gcrootsDir ];
+          # Build metrics read the daemon's cgroup-path map and the cgroup-v2
+          # stat files. ProtectSystem=strict already leaves /sys and /nix
+          # readable; this makes the cgroup map explicitly available (the dir may
+          # not exist until the first cgroup build, hence the `-` prefix).
+          ReadOnlyPaths = lib.optionals cfg.settings.buildMetrics [ "-${cfg.settings.buildCgroupStateDir}" ];
           Restart = "on-failure";
           RestartSec = 10;
           KillMode = "mixed";
           LimitNOFILE = 65535;
+          # Secrets are mlock'd to keep them off swap; without this the lock
+          # fails (EPERM) and floods the log on every SSH-key git operation.
+          LimitMEMLOCK = "128M";
           RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
           RestrictNamespaces = true;
           RestrictRealtime = true;
@@ -337,14 +440,29 @@ in {
           GRADIENT_MAX_CONCURRENT_EVALUATIONS         = toString cfg.settings.maxConcurrentEvaluations;
           GRADIENT_MAX_CONCURRENT_BUILDS              = toString cfg.settings.maxConcurrentBuilds;
           GRADIENT_MAX_NIXDAEMON_CONNECTIONS          = toString cfg.settings.maxNixdaemonConnections;
+          GRADIENT_NAR_PARTIAL_TTL_SECS               = toString cfg.settings.narPartialTtlSecs;
           GRADIENT_WORKER_EVAL_WORKERS                = toString cfg.settings.evalWorkers;
-          GRADIENT_MAX_EVALUATIONS_PER_WORKER         = toString cfg.settings.maxEvaluationsPerWorker;
+          GRADIENT_MAX_EVAL_RSS                       = toString cfg.settings.maxEvalRss;
+          GRADIENT_EVAL_CACHE_SHARE                   = lib.boolToString cfg.settings.evalCacheShare;
+          GRADIENT_EVAL_METRICS_ENABLED               = lib.boolToString cfg.settings.evalMetricsEnabled;
           GRADIENT_MAX_PROTO_CONNECTIONS              = toString cfg.settings.maxProtoConnections;
           GRADIENT_WORKER_GCROOTS_DIR                 = cfg.settings.gcrootsDir;
+          GRADIENT_WORKER_BUILD_METRICS               = lib.boolToString cfg.settings.buildMetrics;
+          GRADIENT_WORKER_BUILD_CGROUP_ROOT           = cfg.settings.buildCgroupRoot;
+          GRADIENT_WORKER_BUILD_CGROUP_STATE_DIR      = cfg.settings.buildCgroupStateDir;
+          GRADIENT_LOG_BURST_BYTES_PER_MIN            = toString cfg.settings.logBurstBytesPerMin;
+          GRADIENT_LOG_SUSTAINED_BYTES_PER_HOUR       = toString cfg.settings.logSustainedBytesPerHour;
+          GRADIENT_LOG_FETCH_FROM_STORE               = lib.boolToString cfg.settings.logFetchFromStore;
         } // lib.optionalAttrs (cfg.settings.architectures != []) {
           GRADIENT_WORKER_ARCHITECTURES = lib.concatStringsSep "," cfg.settings.architectures;
         } // lib.optionalAttrs (cfg.settings.systemFeatures != []) {
           GRADIENT_WORKER_SYSTEM_FEATURES = lib.concatStringsSep "," cfg.settings.systemFeatures;
+        } // lib.optionalAttrs (cfg.settings.cpuCoreScore != null) {
+          GRADIENT_WORKER_CPU_CORE_SCORE = toString cfg.settings.cpuCoreScore;
+        } // lib.optionalAttrs (cfg.settings.evalCacheDir != null) {
+          GRADIENT_EVAL_CACHE_DIR = cfg.settings.evalCacheDir;
+        } // lib.optionalAttrs (cfg.settings.evalForkWorkers != null) {
+          GRADIENT_EVAL_FORK_WORKERS = toString cfg.settings.evalForkWorkers;
         } // {
           GRADIENT_WORKER_CAPABILITY_FEDERATE         = lib.boolToString cfg.capabilities.federate;
           GRADIENT_WORKER_CAPABILITY_FETCH            = lib.boolToString cfg.capabilities.fetch;
@@ -364,11 +482,12 @@ in {
 
     nix.settings = {
       trusted-users = [ "gradient-worker" ];
+      use-cgroups = lib.mkIf cfg.settings.buildMetrics true;
       experimental-features = [
         "nix-command"
         "flakes"
         "ca-derivations"
-      ];
+      ] ++ lib.optional cfg.settings.buildMetrics "cgroups";
     };
 
     services = {

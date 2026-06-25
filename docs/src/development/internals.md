@@ -11,7 +11,7 @@ Key functions inside each crate.
 **GitHub App** (`POST /api/v1/hooks/github`):
 - Verifies `X-Hub-Signature-256` against `GRADIENT_GITHUB_APP_WEBHOOK_SECRET_FILE`.
 - `push` → calls `core::evaluation_trigger::trigger_evaluation` for each matching project.
-- `installation` / `installation_repositories` → stores or clears `organization.github_installation_id`.
+- `installation` / `installation_repositories` → upserts or clears `github_installation` rows and seeds the `github-<account>` integration pair.
 
 **Generic forges** (`POST /api/v1/hooks/{forge}/{org}/{integration_name}`):
 - `{forge}` ∈ `gitea`, `forgejo`, `gitlab`. GitHub deliveries route to the App webhook above.
@@ -59,7 +59,7 @@ Derivations, outputs, dependency edges, and builds are bulk-inserted in chunks o
 
 **4. Status transitions**
 
-```
+```text
 build:       Created → Queued → Building → Completed | Failed
                                          ↘ Substituted (already in store)
                                          ↘ Aborted | DependencyFailed
@@ -68,6 +68,8 @@ evaluation:  Queued → Fetching → EvaluatingFlake → EvaluatingDerivation �
 ```
 
 `Substituted` is distinct from `Completed`: it means the derivation was already in the local Nix store at evaluation time and never ran on a builder.
+
+Builds promote `Created → Queued` incrementally (#392): as soon as a derivation's full set of direct dependency edges is in the DB - which may happen mid-walk - its build is queued, and the dispatcher (which gates on dependencies, not evaluation status) may start it while later derivations still evaluate. The evaluation row stays in `EvaluatingDerivation` until the walk finishes, then moves to `Building`.
 
 ---
 
@@ -124,7 +126,7 @@ This makes "is the full closure of build B available in cache C" a single DB loo
 
 `GET /builds/{build}/graph` - BFS from the requested build, capped at 500 nodes. The graph is stored on derivations, so the BFS walks `derivation_dependency` and resolves each visited derivation back to a `build` row in the same evaluation for UI display:
 
-```
+```text
 root_drv = build.derivation
 visited_drvs = {root_drv}
 queue = [[root_drv]]
@@ -154,7 +156,7 @@ Batching the BFS (one DB round-trip per level) keeps the query count proportiona
 
 **API keys** - 32 random bytes encoded as hex, stored hashed in `api.key`, prefixed with `GRAD` when returned to the user. The `authorization::authorize` middleware accepts both token types in the `Authorization: Bearer` header.
 
-**OIDC** - `oidc_login_create` starts the PKCE flow and stores the verifier in the database. `oidc_login_verify` exchanges the code, fetches user info, upserts the user row, and returns a JWT. Endpoint discovery is automatic from `GRADIENT_OIDC_DISCOVERY_URL/.well-known/openid-configuration`.
+**OIDC** - `oidc_login_create` builds the authorization URL with PKCE (S256), storing `state`, `nonce`, and the PKCE verifier in a short-lived signed `oidc_csrf` cookie. `oidc_login_verify` validates `state`, exchanges the code (sending `code_verifier`), verifies the ID token against the provider JWKS, then upserts the user row and returns a JWT. Endpoint discovery is automatic from `GRADIENT_OIDC_DISCOVERY_URL/.well-known/openid-configuration`.
 
 ---
 
@@ -189,8 +191,8 @@ active task per kind exists; a concurrent `POST` collides on the index
 and the endpoint returns `409 Conflict`.
 
 `POST /admin/maintenance/deep-gc` inserts a `pending` row and spawns the
-sweep via `Shutdown::spawn`. The sweep runs three passes — NAR, blob,
-log — each bidirectionally reconciling its storage backend against the
+sweep via `Shutdown::spawn`. The sweep runs three passes - NAR, blob,
+log - each bidirectionally reconciling its storage backend against the
 DB:
 
 1. **NAR pass** reuses `cleanup_orphaned_cache_files`: removes

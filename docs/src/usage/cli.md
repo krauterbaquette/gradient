@@ -48,7 +48,7 @@ Then log in:
 gradient login
 ```
 
-By default this opens your browser to authorize the CLI session, which is what you want for interactive use and works the same when the Gradient server is configured for OIDC-only login. Pass `--no-browser` to print the URL instead — useful when running over SSH on a headless machine, where you can open the URL on your laptop. The browser flow asks you to confirm a short code that the CLI also prints, then issues a 30-day session token.
+By default this opens your browser to authorize the CLI session, which is what you want for interactive use and works the same when the Gradient server is configured for OIDC-only login. Pass `--no-browser` to print the URL instead - useful when running over SSH on a headless machine, where you can open the URL on your laptop. The browser flow asks you to confirm a short code that the CLI also prints, then issues a 30-day session token.
 
 For unattended scripts you can still pass credentials directly:
 
@@ -62,7 +62,7 @@ Either way, the resulting token is stored in the local configuration file (`~/.c
 
 The CLI trusts the OS certificate store in addition to the bundled Mozilla
 CA roots, so self-hosted instances served behind a private CA work the same
-way `curl` does — install the CA in your system trust store (for example
+way `curl` does - install the CA in your system trust store (for example
 `update-ca-certificates` on Debian/Ubuntu, `trust anchor` on Fedora, or by
 adding it to `/etc/ssl/certs` on NixOS via `security.pki.certificateFiles`)
 and `gradient login` will pick it up. A `transport error` from `gradient
@@ -108,7 +108,8 @@ gradient cache add
 gradient cache remove <name>
 ```
 
-NAR management (list, inspect, delete cached store paths inside a cache):
+NAR management (list, inspect, delete, and upload cached store paths inside a
+cache):
 
 ```sh
 gradient cache nar list <cache> [--hash <prefix>] [--package <substring>] \
@@ -117,14 +118,24 @@ gradient cache nar list <cache> [--hash <prefix>] [--package <substring>] \
 gradient cache nar show <cache> <hash>
 gradient cache nar delete <cache> <hash> [-y]
 gradient cache nar stats <cache>
+
+# Upload a pre-dumped NAR (no Nix required)
+gradient cache upload --nar-file <file.nar> --narinfo <file.narinfo> <cache>
+
+# Upload from the local Nix store (nix feature only)
+gradient cache upload [--full-closure] <store-path>... <cache>
 ```
 
 Deleting a NAR is ref-counted: if the NAR is signed by more than one cache,
 the delete only drops the current cache's signature; the underlying NAR blob
 stays. When the last cache holding a NAR drops it, the blob is GC'd
 asynchronously and any `derivation_output.is_cached` rows for it flip to
-`false`. NAR upload from local store is tracked separately under
-[issue #261](https://github.com/wavelens/gradient/issues/261).
+`false`.
+
+Uploading requires the `writeStore` cache permission. The server enforces a
+maximum NAR upload size (default 512 MiB, configurable via
+`GRADIENT_MAX_NAR_UPLOAD_SIZE`). See [Managing cached NARs](cache-nars.md)
+for full upload documentation.
 
 ### Build Requests
 
@@ -140,7 +151,8 @@ an evaluation under a per-org reserved `build-request` project.
 gradient build                          # eval the project's wildcard target
 gradient build checks.x86_64-linux.foo  # eval a specific attribute path
 gradient build --system x86_64-linux    # override target system (default: org preference)
-gradient build --no-stream              # dispatch and exit without tailing logs
+gradient build -b                       # dispatch and print the evaluation UUID, then exit
+gradient build --no-link                # skip producing a result symlink/folder
 ```
 
 Requirements and limits:
@@ -149,7 +161,64 @@ Requirements and limits:
 - Only files git tracks are uploaded; untracked files and `.git/` are skipped.
 - Combined upload size must not exceed **20 MiB** (`MAX_BUILD_REQUEST_SIZE`).
 - The default flow streams logs from all queued builds until they complete;
-  pass `--no-stream` to return immediately after dispatch.
+  pass `-b`/`--background` to print only the evaluation UUID and return
+  immediately. Pair it with [`gradient watch`](#watching-an-evaluation) to
+  follow the build later: `eval=$(gradient build -b); gradient watch "$eval"`.
+
+After a foreground build completes, the CLI produces a `result` for the primary
+output (use `--no-link` to skip it):
+
+- A CLI built with the `nix` feature substitutes every output from the org cache
+  into the local Nix store via `nix copy` and creates a single GC-rooted `result`
+  symlink to the primary output (like `nix build`). It also packs the source NAR
+  locally and uploads it in one shot (`POST /build-requests/source`), skipping the
+  per-file blob manifest.
+- A CLI without the `nix` feature downloads the primary entry point's build
+  products into a `result/` folder (only declared `hydra-build-products` are
+  included).
+
+### Watching an evaluation
+
+`gradient watch <evaluation>` opens a live full-screen dashboard for any
+evaluation UUID. It shows the evaluation status and elapsed time, a per-build
+list with statuses and build times, evaluation messages and errors as they
+appear, and a follow-tail log pane that merges every build's output.
+
+```sh
+gradient watch 0190f3c2-...   # live dashboard for an evaluation
+```
+
+Key bindings: `↑`/`↓` scroll the log, `f` toggle follow-tail, `q`/`Esc` quit.
+In `--json` mode the dashboard is skipped and the merged build logs are streamed
+as JSON envelopes to stdout instead.
+
+### Builds
+
+`gradient builds` is a top-level command group for inspecting build metadata
+after dispatch.
+
+```sh
+# Collapsible dependency-graph browser for a specific build
+gradient builds graph <build-id> [-i]
+
+# Build log viewer / streamer for a specific build
+gradient builds log <build-id> [-i]
+```
+
+Without `-i`, `builds graph` prints the node and edge counts to stdout.
+Without `-i`, `builds log` streams the log to stdout.
+
+### Interactive mode (`-i` / `--interactive`)
+
+Several commands accept `-i` / `--interactive` to open a full-screen
+[ratatui](https://github.com/ratatui/ratatui) TUI instead of plain text
+output. The flag is silently ignored in `--json` mode.
+
+| Command | TUI description | Key bindings |
+|---|---|---|
+| `gradient cache nar list -i` | Scrollable, type-to-filter NAR browser | Type to filter by package or hash; `↑`/`↓` navigate; `Esc` quit |
+| `gradient builds graph <id> -i` | Collapsible dependency-graph browser (nix-tree style) | `↑`/`↓` navigate; `Enter`/`Space` expand or collapse a node; `Esc` quit |
+| `gradient builds log <id> -i` | Less-style log pager with follow-tail | `↑`/`↓` scroll; `f` toggle follow-tail; `/` search; `Esc` quit |
 
 ### Downloading artefacts
 
@@ -193,7 +262,7 @@ Project and worker name completion uses the currently selected organization
 
 ## Global Options
 
-```
+```text
 gradient --help      Show help for any command
 gradient --version   Print CLI version
 gradient --json      Emit machine-readable JSON output

@@ -29,6 +29,28 @@ export interface BuildGraph {
   edges: DependencyEdge[];
 }
 
+export interface ClosureNode {
+  id: string;
+  name: string;
+  path: string;
+  nar_size: number | null;
+}
+
+export interface ClosureEdge {
+  source: string;
+  target: string;
+}
+
+export interface ClosureGraph {
+  roots: string[];
+  total_size_bytes: number | null;
+  node_count: number;
+  edge_count: number;
+  truncated: boolean;
+  nodes: ClosureNode[];
+  edges: ClosureEdge[];
+}
+
 export interface BuildItem {
   id: string;
   name: string;          // derivation path
@@ -36,6 +58,18 @@ export interface BuildItem {
   has_artefacts: boolean;
   updated_at: string;
   build_time_ms: number | null;
+}
+
+export interface BuildWithOutputs {
+  id: string;
+  evaluation: string;
+  status: string;
+  derivation_path: string;
+  architecture: string;
+  worker: string | null;
+  output: Record<string, string>;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PaginatedBuilds {
@@ -84,6 +118,10 @@ export class EvaluationsService {
     return this.api.get<PaginatedBuilds>(`evals/${evaluationId}/builds${query}`);
   }
 
+  getBuild(buildId: string): Observable<BuildWithOutputs> {
+    return this.api.get<BuildWithOutputs>(`builds/${buildId}`);
+  }
+
   getBuildLog(buildId: string): Observable<string> {
     return this.api.get<string>(`builds/${buildId}/log`);
   }
@@ -94,6 +132,22 @@ export class EvaluationsService {
 
   getBuildGraph(buildId: string): Observable<BuildGraph> {
     return this.api.get<BuildGraph>(`builds/${buildId}/graph`);
+  }
+
+  getBuildClosure(buildId: string): Observable<ClosureGraph> {
+    return this.api.get<ClosureGraph>(`builds/${buildId}/closure`);
+  }
+
+  getEvalClosure(evalId: string): Observable<ClosureGraph> {
+    return this.api.get<ClosureGraph>(`evals/${evalId}/closure`);
+  }
+
+  getBuildRuntimeClosure(buildId: string): Observable<ClosureGraph> {
+    return this.api.get<ClosureGraph>(`builds/${buildId}/runtime-closure`);
+  }
+
+  getEvalRuntimeClosure(evalId: string): Observable<ClosureGraph> {
+    return this.api.get<ClosureGraph>(`evals/${evalId}/runtime-closure`);
   }
 
   getBuildDownloads(buildId: string): Observable<BuildProduct[]> {

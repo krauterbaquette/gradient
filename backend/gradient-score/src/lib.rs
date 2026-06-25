@@ -1,0 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Wavelens GmbH <info@wavelens.io>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+pub mod breakdown;
+pub mod context;
+pub mod policy;
+pub mod rule;
+pub mod rules;
+
+pub use breakdown::ScoreBreakdown;
+pub use context::{
+    BuildContext, BuildContextLazy, DerivationRef, EvalContext, HistoryPrediction, InstanceContext,
+    JobKindContext, LazyProviders, ScoredJob, Windowed, WorkerMetricsView,
+};
+pub use policy::{policy_by_name, rule_catalog, RulePolicy, ScoringPolicy};
+pub use rule::{JobContext, ScoreRule, WorkerContext};

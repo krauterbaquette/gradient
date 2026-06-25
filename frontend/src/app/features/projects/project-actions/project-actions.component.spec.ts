@@ -98,7 +98,17 @@ describe('ProjectActionsComponent', () => {
     expect(deleteBtn).not.toBeNull();
     expect(deleteBtn!.disabled).toBe(true);
     expect(testBtn).not.toBeNull();
-    expect(testBtn!.disabled).toBe(true);
+    // Test is a trigger action, not a config edit - exempt from the managed flag (AccessService.triggerAccess).
+    expect(testBtn!.disabled).toBe(false);
+  });
+
+  it('includes a Settings link in the breadcrumb', () => {
+    const fixture = setup({ managed: false, canEdit: true, canTrigger: true });
+    const link = Array.from(
+      fixture.nativeElement.querySelectorAll('.breadcrumb a.breadcrumb-link'),
+    ).find((a) => (a as HTMLElement).textContent?.trim() === 'Settings') as HTMLAnchorElement | undefined;
+    expect(link).toBeTruthy();
+    expect(link!.getAttribute('href')).toContain('/settings');
   });
 
   it('renders action name and event chips', () => {

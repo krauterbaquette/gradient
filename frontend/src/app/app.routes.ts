@@ -7,6 +7,7 @@
 import { Routes } from '@angular/router';
 import { authGuard } from '@core/guards/auth.guard';
 import { adminGuard } from '@core/guards/admin.guard';
+import { unsavedChangesGuard } from '@core/guards/unsaved-changes.guard';
 import { projectAccessResolver } from '@core/resolvers/project-access.resolver';
 import { cacheAccessResolver } from '@core/resolvers/cache-access.resolver';
 import { organizationAccessResolver } from '@core/resolvers/organization-access.resolver';
@@ -150,6 +151,15 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'organization/:org/closure/:kind/:id',
+    title: 'Closure',
+    data: { hideFooter: true },
+    loadComponent: () =>
+      import('./features/evaluations/closure-graph/closure-graph.component').then(
+        (m) => m.ClosureGraphComponent
+      ),
+  },
+  {
     path: 'organization/:org/log/:evaluationId',
     title: 'Evaluation Log',
     data: { hideFooter: true },
@@ -255,6 +265,100 @@ export const routes: Routes = [
           import('./features/dashboard/dashboard.component').then((m) => m.DashboardComponent),
       },
 
+      // Job Board
+      {
+        path: 'board',
+        title: 'Job Board',
+        loadComponent: () =>
+          import('./features/board/board-layout.component').then((m) => m.BoardLayoutComponent),
+        children: [
+          { path: '', pathMatch: 'full', redirectTo: 'overview' },
+          {
+            path: 'overview',
+            loadComponent: () =>
+              import('./features/board/overview/overview.component').then(
+                (m) => m.BoardOverviewComponent
+              ),
+          },
+          {
+            path: 'live',
+            loadComponent: () =>
+              import('./features/board/live-jobs/live-jobs.component').then(
+                (m) => m.BoardLiveJobsComponent
+              ),
+          },
+          {
+            path: 'jobs/:id',
+            title: 'Dispatched Job',
+            loadComponent: () =>
+              import('./features/board/job-detail/job-detail.component').then(
+                (m) => m.BoardJobDetailComponent
+              ),
+          },
+          {
+            path: 'scheduler',
+            loadComponent: () =>
+              import('./features/board/scheduler/scheduler.component').then(
+                (m) => m.BoardSchedulerComponent
+              ),
+          },
+          {
+            path: 'throughput',
+            loadComponent: () =>
+              import('./features/board/throughput/throughput.component').then(
+                (m) => m.BoardThroughputComponent
+              ),
+          },
+          {
+            path: 'durations',
+            loadComponent: () =>
+              import('./features/board/durations/durations.component').then(
+                (m) => m.BoardDurationsComponent
+              ),
+          },
+          {
+            path: 'workers',
+            loadComponent: () =>
+              import('./features/board/workers/workers.component').then(
+                (m) => m.BoardWorkersComponent
+              ),
+          },
+          {
+            path: 'cache',
+            loadComponent: () =>
+              import('./features/board/cache/cache.component').then((m) => m.BoardCacheComponent),
+          },
+          {
+            path: 'network',
+            loadComponent: () =>
+              import('./features/board/network/network.component').then(
+                (m) => m.BoardNetworkComponent
+              ),
+          },
+          {
+            path: 'health',
+            loadComponent: () =>
+              import('./features/board/health/health.component').then(
+                (m) => m.BoardHealthComponent
+              ),
+          },
+          {
+            path: 'expensive',
+            loadComponent: () =>
+              import('./features/board/expensive-jobs/expensive-jobs.component').then(
+                (m) => m.BoardExpensiveJobsComponent
+              ),
+          },
+          {
+            path: 'expensive-evals',
+            loadComponent: () =>
+              import('./features/board/expensive-evals/expensive-evals.component').then(
+                (m) => m.BoardExpensiveEvalsComponent
+              ),
+          },
+        ],
+      },
+
       // Organizations
       {
         path: 'organization/:org/settings',
@@ -283,6 +387,15 @@ export const routes: Routes = [
         loadComponent: () =>
           import('./features/organizations/workers/workers.component').then(
             (m) => m.WorkersComponent
+          ),
+      },
+      {
+        path: 'organization/:org/workers/:workerId/metrics',
+        title: 'Worker Statistics',
+        resolve: { organizationAccess: organizationAccessResolver },
+        loadComponent: () =>
+          import('./features/organizations/workers/worker-metrics/worker-metrics.component').then(
+            (m) => m.WorkerMetricsComponent
           ),
       },
 
@@ -340,6 +453,7 @@ export const routes: Routes = [
     path: 'admin/github-app',
     title: 'GitHub App (admin)',
     canActivate: [authGuard, adminGuard],
+    canDeactivate: [unsavedChangesGuard],
     loadComponent: () =>
       import('./features/admin/github-app/github-app.component').then(
         (m) => m.GithubAppComponent,

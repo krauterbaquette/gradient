@@ -5,6 +5,7 @@
  */
 
 use crate::commands::cache_nar;
+use crate::commands::cache_upload;
 use crate::commands::completion;
 use crate::input::{client_from_config, handle_input};
 use crate::output::{ExitKind, Output, to_exit_kind};
@@ -24,6 +25,9 @@ pub enum Commands {
         description: Option<String>,
         #[arg(short, long)]
         priority: Option<i32>,
+        /// Max cache storage in GB. 0 = unlimited (default); otherwise at least 1.
+        #[arg(short = 'm', long, default_value_t = 0)]
+        max_storage_gb: i32,
     },
     List,
     Edit {
@@ -35,6 +39,9 @@ pub enum Commands {
         description: Option<String>,
         #[arg(short, long)]
         priority: Option<i32>,
+        /// Max cache storage in GB. 0 = unlimited (default); otherwise at least 1.
+        #[arg(short = 'm', long, default_value_t = 0)]
+        max_storage_gb: i32,
     },
     Delete {
         #[arg(add = ArgValueCompleter::new(completion::complete_caches))]
@@ -67,6 +74,8 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: cache_nar::Commands,
     },
+    /// Upload NAR(s) to a cache
+    Upload(crate::commands::cache_upload::UploadArgs),
 }
 
 pub async fn handle(cmd: Commands, out: Output) {
@@ -76,12 +85,14 @@ pub async fn handle(cmd: Commands, out: Output) {
             display_name,
             description,
             priority,
+            max_storage_gb,
         } => {
             let input_fields = [
                 ("Name", name),
                 ("Display Name", display_name),
                 ("Description", description),
                 ("Priority", priority.map(|p| p.to_string())),
+                ("Max Storage (GB)", Some(max_storage_gb.to_string())),
             ]
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -94,6 +105,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                 Ok(p) => p,
                 Err(_) => out.err(ExitKind::Usage, "Priority must be an integer."),
             };
+            let max_storage_gb = parse_max_storage_gb(input.get("Max Storage (GB)").unwrap(), out);
 
             let client = client_from_config(out);
             match client
@@ -103,6 +115,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                     display_name: input.get("Display Name").unwrap().clone(),
                     description: input.get("Description").unwrap().clone(),
                     priority,
+                    max_storage_gb,
                 })
                 .await
             {
@@ -136,11 +149,13 @@ pub async fn handle(cmd: Commands, out: Output) {
             display_name,
             description,
             priority,
+            max_storage_gb,
         } => {
             let input_fields = [
                 ("Display Name", display_name),
                 ("Description", description),
                 ("Priority", priority.map(|p| p.to_string())),
+                ("Max Storage (GB)", Some(max_storage_gb.to_string())),
             ]
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
@@ -152,6 +167,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                 Ok(p) => p,
                 Err(_) => out.err(ExitKind::Usage, "Priority must be an integer."),
             };
+            let max_storage_gb = parse_max_storage_gb(input.get("Max Storage (GB)").unwrap(), out);
 
             let client = client_from_config(out);
             match client
@@ -161,6 +177,7 @@ pub async fn handle(cmd: Commands, out: Output) {
                     display_name: input.get("Display Name").unwrap().clone(),
                     description: input.get("Description").unwrap().clone(),
                     priority,
+                    max_storage_gb,
                 })
                 .await
             {
@@ -264,6 +281,18 @@ pub async fn handle(cmd: Commands, out: Output) {
         }
 
         Commands::Nar { cmd } => cache_nar::handle(cmd, out).await,
+        Commands::Upload(args) => cache_upload::handle(args, out).await,
+    }
+}
+
+fn parse_max_storage_gb(raw: &str, out: Output) -> i32 {
+    match raw.trim().parse::<i32>() {
+        Ok(v) if v >= 0 => v,
+        Ok(_) => out.err(
+            ExitKind::Usage,
+            "Max storage must be 0 (unlimited) or at least 1.",
+        ),
+        Err(_) => out.err(ExitKind::Usage, "Max storage must be an integer."),
     }
 }
 

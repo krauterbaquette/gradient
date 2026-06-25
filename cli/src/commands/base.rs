@@ -95,11 +95,19 @@ enum MainCommands {
         system: Option<String>,
         #[arg(short, long)]
         organization: Option<String>,
-        /// Skip log streaming and exit after dispatch
-        #[arg(long)]
-        no_stream: bool,
+        /// Dispatch and return the evaluation UUID without streaming logs
+        #[arg(short, long)]
+        background: bool,
         #[arg(short, long)]
         quiet: bool,
+        /// Do not produce a `result` symlink/folder after the build
+        #[arg(long)]
+        no_link: bool,
+    },
+    /// Watch a running evaluation's live build logs and status
+    Watch {
+        /// Evaluation UUID to watch
+        evaluation: String,
     },
     /// Download evaluation artefacts
     Download {
@@ -117,6 +125,11 @@ enum MainCommands {
         /// Write to this directory (default: current directory)
         #[arg(long)]
         out: Option<String>,
+    },
+    /// Inspect builds (dependency graph)
+    Builds {
+        #[command(subcommand)]
+        cmd: builds::Commands,
     },
     /// Generate project files
     Generate {
@@ -286,9 +299,13 @@ pub async fn run_cli() -> std::io::Result<()> {
             target,
             system,
             organization,
-            no_stream,
+            background,
             quiet,
-        } => build::handle_build(target, system, organization, no_stream, quiet, out).await,
+            no_link,
+        } => {
+            build::handle_build(target, system, organization, background, quiet, no_link, out).await
+        }
+        MainCommands::Watch { evaluation } => watch::handle_watch(&evaluation, out).await,
         MainCommands::Download {
             flake_ref,
             evaluation,
@@ -302,6 +319,7 @@ pub async fn run_cli() -> std::io::Result<()> {
         MainCommands::Project { cmd } => project::handle(cmd, out).await,
         MainCommands::Worker { cmd } => worker::handle(cmd, out).await,
         MainCommands::Cache { cmd } => cache::handle(cmd, out).await,
+        MainCommands::Builds { cmd } => builds::handle(cmd, out).await,
         MainCommands::Generate { cmd } => generate::handle(cmd, out).await,
         MainCommands::Hash => {
             let password = ask_for_password();

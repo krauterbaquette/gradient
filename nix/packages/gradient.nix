@@ -10,7 +10,7 @@
 , glibc
 , installShellFiles
 , llvmPackages
-, nixVersions
+, gradient-nix
 , openssl
 , pkg-config
 , pkgs
@@ -18,7 +18,6 @@
 }:
 let
   testStore = import ../scripts/store.nix { inherit pkgs; };
-  nixVersion = nixVersions.nix_2_34;
 
   unfilteredRoot = ../../backend;
 
@@ -61,13 +60,13 @@ let
     nativeBuildInputs = [
       installShellFiles
       pkg-config
-      (lib.getDev nixVersion)
+      (lib.getDev gradient-nix)
       (lib.getDev glibc)
     ];
 
     buildInputs = [
       git
-      nixVersion
+      gradient-nix
       openssl
       zstd
     ];

@@ -2,13 +2,14 @@
 
 Actions are the response-side counterpart of Triggers. Where a Trigger fires an evaluation when an event arrives, an Action reacts to evaluation and build lifecycle events and does something: sends an email, calls a webhook, or posts a commit status back to a forge.
 
-Actions are per-project. Three types ship in v1:
+Actions are per-project. Four types ship in v1:
 
 | Type | Summary | Prerequisite |
 |---|---|---|
 | `send_mail` | Email one or more recipients | Server SMTP configured |
 | `send_web_request` | HTTP POST to an external URL | None |
 | `forge_status_report` | Post commit status to a forge | Outbound integration in the org |
+| `open_pr` | Open/update a flake.lock-update pull request | Outbound integration in the org |
 
 ## Events
 
@@ -28,7 +29,7 @@ Actions are per-project. Three types ship in v1:
 | `build.failed` | Build failed |
 | `build.substituted` | Build output came from an upstream cache substitution |
 
-An action with an empty `events` list never fires. `forge_status_report` ignores the `events` list — it is hard-wired to `build.started`, `build.completed`, and `build.failed`.
+An action with an empty `events` list never fires. `forge_status_report` ignores the `events` list - it is hard-wired to the full evaluation and build lifecycle (every `evaluation.*` and `build.*` event above), so the per-build check tracks live progress, not just the terminal result.
 
 ## Send Mail
 
@@ -60,7 +61,7 @@ POSTs a JSON payload to a URL. Optional `Authorization: Bearer <token>` header.
 
 **Request headers:**
 
-```
+```http
 Content-Type: application/json
 X-Gradient-Event: build.completed
 Authorization: Bearer <token>   # only if token is set
@@ -78,11 +79,17 @@ Authorization: Bearer <token>   # only if token is set
 }
 ```
 
-Token management: the plaintext token is revealed exactly once — on create or after `POST .../regenerate-token`. Store it immediately.
+Token management: the plaintext token is revealed exactly once - on create or after `POST .../regenerate-token`. Store it immediately.
 
 ## Forge Status Report
 
-Posts commit status (pending / success / failure / action-required) back to the forge as three separate check runs per PR — `gradient/{project}: Approval` (fork-PR gate), `gradient/{project}: Evaluation` (eval phase), and `gradient/{project}: Build {label}` (one per build, labelled by entry-point name or by `{drv-name}.{architecture}` when no entry-point matched). Each check is updated in place as the phase progresses; the Approval check flips to Success when a maintainer clears the gate, and the Evaluation check is posted as Pending at the same instant so the PR immediately reflects that the pipeline is in flight.
+Posts commit status (pending / success / failure / action-required) back to the forge as three separate check runs per PR - `gradient/{project}: Approval` (fork-PR gate), `gradient/{project}: Evaluation` (eval phase), and `gradient/{project}: Build {label}` (one per entry point, labelled by its entry-point name). Each check is updated in place as the phase progresses; the Approval check flips to Success when a maintainer clears the gate, and the Evaluation check is posted as Pending at the same instant so the PR immediately reflects that the pipeline is in flight.
+
+Each `Build {label}` check tracks its entry point's whole lifecycle, not just the final result: Pending when the build is queued, Running while it builds, then Success when it completes or is substituted from cache. A build that fails reports Failure - and a dependency failure or an abort surfaces as a failed Build check too, rather than leaving the check stuck on Pending. (The graph transitions that queue, dependency-fail, or abort a build run as bulk SQL updates outside the per-build status path, so the reporter is notified for the affected entry points explicitly.)
+
+A run that targets a wildcard other than the project default - e.g. `/gradient run packages.x86_64-linux.foo` - reports under `gradient/{project}: Evaluation: {wildcard}` so the custom run shows as its own check line instead of overwriting the default evaluation check.
+
+**Maintainer-initiated runs skip the fork-PR approval gate.** The gate only exists to hold untrusted external contributions; when the action comes from a repo writer it is not needed. The Evaluation runs immediately (no `Approval` check) when any of these happen: a maintainer issues `/gradient run` / `/gradient approve` on the PR, a maintainer submits an approving review through the forge's native PR-review UI (GitHub / Gitea / Forgejo `pull_request_review`), or a maintainer force-pushes onto the contributor's branch. In every case the actor is verified as a repo writer via the forge API before the gate is cleared. GitLab is the exception - it emits no webhook on merge-request approval, so use `/gradient approve` there.
 
 **Config fields:**
 
@@ -91,6 +98,29 @@ Posts commit status (pending / success / failure / action-required) back to the 
 | `integration_id` | yes | UUID of an outbound integration in the same org |
 
 The integration must be `kind: outbound`. The forge type determines the API call format (Gitea, GitLab, GitHub App).
+
+The **Test** button does not post a synthetic status (a forge rejects a status against a placeholder commit); it runs a non-mutating connectivity check that confirms the integration's credentials can reach the project repository. The same applies to **Open PR**.
+
+## Open PR
+
+Opens (or updates) a pull request that bumps the project's flake inputs, driven by a native `flake.lock` updater. Unlike the other actions it does not react to a project's ordinary runs: it fires on a verify-gate event (default `build.completed`) but only for `input_update` evaluations.
+
+**Config fields:**
+
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `integration_id` | yes | (none) | UUID of an outbound integration in the same org |
+| `generator` | no | `flake_lock` | Update generator; only the native flake.lock updater exists in v1 |
+| `granularity` | no | `per_run` | `per_run` opens one PR for the whole run; `per_input` opens one PR per tracked input |
+| `verify_gate` | no | `build` | How far the candidate lock is verified before the PR opens: `none`, `eval`, or `build` |
+| `branch_pattern` | no | `gradient/flake-lock-update` | Branch name for the PR; for `per_input` it must contain the `{input}` placeholder |
+| `title_template` | no | (none) | PR title with placeholders |
+| `body_template` | no | (none) | PR body with placeholders |
+| `update_existing` | no | `true` | Update an already-open PR in place instead of opening a duplicate |
+
+**Tracked inputs.** The set of inputs to bump is declared with flake-input override rows on the project. An override whose `url` is unset marks that input as *tracked*, and it will be bumped to its newest revision. As a safety gate, the presence of *any* override with a `url` set (a pinned input) blocks the run, so a project cannot accidentally open a PR while an input is being held at a fixed revision. v1 supports `github`, `gitlab`, and `git` flake inputs.
+
+**PR lifecycle.** A trigger fires; if the project has an `open_pr` action and at least one tracked input, Gradient creates an `input_update` evaluation. The worker bumps each tracked input to its newest revision with a natively recomputed `narHash`, and the candidate lock is verified by a normal eval/build per `verify_gate`. Once the verify gate passes, the PR is opened or, when `update_existing` is true, updated in place. An empty or no-change patch opens no PR.
 
 ## Declarative configuration via Nix
 
@@ -120,6 +150,16 @@ services.gradient.state.projects.web-app = {
       type = "forge_status_report";
       config = {
         integration = "github-main";
+      };
+    }
+    {
+      name = "flake-lock-pr";
+      type = "open_pr";
+      config = {
+        integration = "github-main";
+        granularity = "per_input";
+        verify_gate = "build";
+        branch_pattern = "gradient/flake-lock-update/{input}";
       };
     }
   ];

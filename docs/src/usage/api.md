@@ -12,7 +12,7 @@ The full OpenAPI 3.1 specification is in the repository at `docs/gradient-api.ya
 
 Endpoints under `/api/v1` (except `/auth/*`, `/health`, and `/config`) require a bearer token:
 
-```
+```http
 Authorization: Bearer <token>
 ```
 
@@ -252,6 +252,7 @@ Set `GRADIENT_WORKER_PEERS_FILE` (or the NixOS `peersFile` option) to this path.
 | `PUT` | `/projects/{org}` | Create project |
 | `GET/PATCH/DELETE` | `/projects/{org}/{project}` | Get / update / delete |
 | `GET` | `/projects/{org}/{project}/details` | Aggregated project data |
+| `GET` | `/projects/{org}/{project}/evaluations` | List recent evaluations (optional `?limit=`) |
 | `GET` | `/projects/{org}/{project}/entry-points` | Root builds |
 | `POST` | `/projects/{org}/{project}/check-repository` | Test repo access |
 | `POST` | `/projects/{org}/{project}/evaluate` | Trigger evaluation |
@@ -273,11 +274,18 @@ Set `GRADIENT_WORKER_PEERS_FILE` (or the NixOS `peersFile` option) to this path.
 | `POST` | `/builds` | Submit direct build (multipart) |
 | `GET` | `/builds/direct/recent` | Recent direct builds |
 | `GET` | `/builds/{id}` | Build with outputs |
-| `GET/POST` | `/builds/{id}/log` | Get log / stream live log |
+| `GET/POST` | `/builds/{id}/log` | Get full log / stream live log |
+| `GET` | `/builds/{id}/log/chunks` | Chunk index of a finalized log |
+| `GET` | `/builds/{id}/log/chunk/{index}` | One decompressed chunk (plaintext) |
+| `GET` | `/builds/{id}/log/lines` | Line range, e.g. `?range=L120-L130` |
+| `GET` | `/builds/{id}/log/search` | NDJSON stream of search hits (`?q=`) |
 | `GET` | `/builds/{id}/graph` | Full dependency graph |
 | `GET` | `/builds/{id}/dependencies` | Direct dependencies |
 | `GET` | `/builds/{id}/downloads` | List artefacts |
 | `GET` | `/builds/{id}/download/{filename}` | Download artefact |
+
+The `/log*` endpoints fall back to the most recent prior build of the same
+derivation for a `Substituted` build (which has no log of its own).
 
 ### Caches
 
@@ -294,6 +302,27 @@ Set `GRADIENT_WORKER_PEERS_FILE` (or the NixOS `peersFile` option) to this path.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/commits/{id}` | Get commit |
+
+### Live updates (WebSocket)
+
+These endpoints upgrade to a WebSocket and push JSON events when the relevant
+resource changes, so the frontend refetches on change instead of polling. Each
+channel only forwards events for its resource (authorized at connect).
+
+| Path | Events |
+|---|---|
+| `/board/live` | `queue_depth`, `job_dispatched`, `worker_connected`, `worker_disconnected` (scope-masked) |
+| `/projects/{org}/{project}/live` | `evaluation_status_changed`, `build_status_changed`, `evaluation_progress` for the project |
+| `/evals/{evaluation}/live` | `evaluation_status_changed`, `build_status_changed`, `evaluation_progress` for the evaluation |
+| `/builds/{build}/live` | `build_status_changed` for the build's evaluation (its dependency graph) |
+| `/board/cache/live` | `cache_changed` (content-free ping; refetch `/board/cache`) |
+
+Frames are JSON with a `type` field, e.g.
+`{"type":"build_status_changed","evaluation_id":"…","build_id":"…","status":2}`.
+`evaluation_progress` (`{"type":"evaluation_progress","project":"…","evaluation_id":"…"}`)
+is a content-free ping emitted as builds and entry-points are persisted during
+the evaluation phase - before any build changes status - so the build and
+dependency totals grow live instead of only appearing once evaluation finishes.
 
 ### Nix Binary Cache (root, no `/api/v1` prefix)
 

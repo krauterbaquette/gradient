@@ -2,6 +2,276 @@
 
 This page tracks notable tests added to Gradient and where they live.
 
+## Per-build forge check tracks the whole lifecycle
+
+`backend/gradient-ci/src/reporting.rs`: `build_event_for_status` maps a build
+status to the dispatch event the per-entry-point forge check reports.
+- `build_event_posts_live_progress` - `Queued` -> `build.queued` (Pending),
+  `Building` -> `build.started` (Running), `Completed`/`Substituted` -> their
+  terminal events, so the `Build {label}` check tracks progress instead of only
+  appearing once the build is done.
+- `build_event_dependency_failure_and_abort_are_failures` - `FailedPermanent`,
+  `FailedTimeout`, `DependencyFailed`, and `Aborted` all report `build.failed`
+  (which `forge_status_for_event` maps to `Failure`), so a dependency-failed or
+  aborted entry point shows a failed check rather than a check stuck on Pending.
+- `build_event_skips_created` - the initial `Created` state posts no check.
+
+Queued/dependency-failed/aborted transitions run as bulk SQL updates that bypass
+`update_derivation_build_status`; `notify_build_status_for_derivations`
+(`backend/gradient-db/src/status/derivation_build_status.rs`) fires the reactor
+for the affected entry points so those events still reach the forge.
+
+## S3 build logs are not cached on local disk
+
+`backend/gradient-storage/src/log.rs`: `s3_chunks_are_not_cached_on_local_disk`
+asserts `S3LogStorage::write_chunk` writes finalized log chunks only to the
+object store, not to the local file store, so an S3 backend keeps no build logs
+on local disk at rest (the live log still appends locally during a build and is
+dropped on finalize). Reads fall back to S3.
+
+## Evaluation GC keeps failed/aborted NARs and defers during active runs
+
+`backend/gradient-db/src/gc.rs`: `skips_gc_while_an_evaluation_is_active`,
+`retains_keep_most_recent_terminal_regardless_of_outcome`,
+`keeps_single_terminal_within_keep`, and `deletes_terminal_evaluations_beyond_keep`
+cover `evaluations_to_gc` after it stopped deprioritizing `Aborted` runs and
+started skipping the whole project while any evaluation is active. Previously GC
+preferentially deleted failed/aborted evaluations (dropping the completed NARs
+they held) and could race an in-flight run.
+
+## GitHub App installation org-binding
+
+`backend/gradient-web/src/endpoints/forge_hooks/trigger.rs`:
+`github_full_name_parses_every_url_form`, `github_full_name_rejects_non_github_hosts`,
+and `installation_payload_collects_full_names_from_both_arrays` cover the binding
+of an `installation` / `installation_repositories` webhook to every org owning a
+project whose repository URL resolves to one of the payload's repositories. The
+match is purely on the parsed `owner/repo`, so the flake shorthand
+(`github:owner/repo`) binds the same as the https / SSH clone URLs; previously the
+matcher keyed off a literal `github.com` substring and an org-name equals login
+fallback, so a `github:`-form project (and any org not named after the account)
+left the org without a `github_installation` row.
+
+`github_installation.created_at` must be `TIMESTAMP` to match the entity's
+`NaiveDateTime`; the create migration originally typed it `TIMESTAMPTZ`, so every
+read (e.g. `PUT /orgs/{org}/integrations`) failed to decode the column (#449).
+`m20260620_000004` converts the column in place on already-migrated installs
+(conditional on the current type, so it is a no-op once `TIMESTAMP`). Verified by
+E2E CI against real PostgreSQL; sea-orm `MockDatabase` cannot reproduce the
+column-type decode error.
+
+`event_repo_matches_project_is_host_agnostic_on_owner_repo`,
+`event_repo_rejects_a_sibling_repo_in_the_same_org`,
+`event_repo_empty_urls_match_every_project`, and
+`event_repo_unparsable_project_never_matches` cover the fan-out repo gate: an
+org-wide inbound integration (a GitHub App installation spans every repo in the
+org) must fire only triggers whose project tracks the repository the webhook
+event came from. Matching is host-agnostic on `owner/repo`. Without it a push/PR
+to one repo fanned out to sibling projects, whose eval carried the wrong repo's
+commit and made the reporter post a check-run for a SHA absent from the project's
+repo (GitHub 422 "No commit found for SHA", #449).
+
+## Per-forge webhook events guidance (Gitea/Forgejo/GitLab `/gradient` commands)
+
+`frontend/.../integrations/integrations.component.spec.ts`: two specs assert
+`requiredWebhookEvents` lists the events the server actually classifies - Gitea/
+Forgejo get `Issue Comment` + `Pull Request Review` (and never push-only), GitLab
+gets `Merge request` + `Comments (note)`. A push-only forge webhook never
+delivers the comment/note or PR/review events, so `/gradient run` / `/gradient
+approve` and PR CI silently never fire on these forges (unlike the GitHub App,
+whose manifest auto-subscribes to `issue_comment`/`pull_request_review`); the
+inbound-integration card and the setup docs now surface the full event set.
+
+## Forgejo webhook header support (#460)
+
+`backend/gradient-forge/src/providers/gitea.rs`:
+- `accepts_forgejo_and_gitea_headers` - the Gitea/Forgejo provider lists both
+  `X-Forgejo-Event`/`X-Forgejo-Signature` and the Gitea-prefixed equivalents, so
+  a Forgejo host (e.g. Codeberg) that sends only its own header family is still
+  classified and signature-verified instead of falling through to a silent
+  `Unknown`-event 200. The signature check runs before event classification, so
+  a missing header family previously dropped every webhook.
+- `classifies_pr_comment_as_comment` - `issue_comment` / `pull_request_comment`
+  map to `WebhookEventKind::Comment`.
+
+When a `/gradient` comment is delivered but the integration has no project with a
+usable forge reporter (no API token), `handle_issue_comment` now logs a `warn`
+instead of silently returning, making the "nothing happened" case diagnosable.
+
+## GitHub App setup cleanup + state surfacing + breadcrumbs (#441, #452)
+
+Frontend (`pnpm --dir frontend exec ng test --include='**/eval-status-badge.component.spec.ts' --watch=false`):
+- shared `EvalStatusBadgeComponent` collapses `Evaluating*` to `Evaluating`,
+  applies the success class for `Completed`, spins a running icon, and pulses a
+  queued icon. Reused by the organization detail list and the project detail
+  title (one source of truth for the eval status tag).
+
+Frontend (`**/project-detail.component.spec.ts`):
+- `disables Start Evaluation while an evaluation is in progress` and `enables
+  Start Evaluation once the latest evaluation finished` - the button is gated on
+  `evaluationInProgress()` so it no longer surfaces "evaluation already in
+  progress".
+- `shows the eval status badge in the title while in progress` / `hides the title
+  badge when the latest evaluation is terminal`.
+
+Frontend (`**/project-actions.component.spec.ts`):
+- `includes a Settings link in the breadcrumb` - Actions breadcrumb is now
+  `[Org] / [Project] / Settings / Actions`.
+
+## Forge action "Test" button connectivity probe
+
+`backend/gradient-forge/src/reporter.rs`: `verify_reads_repo_without_reporting`
+asserts `CiReporter::verify` performs a non-mutating repo read (the default
+branch) and never calls `report`, and propagates a forge error when the repo is
+unreachable. This backs the Actions Test button, which now probes connectivity
+for `forge_status_report` / `open_pr` instead of posting a status against a
+placeholder commit (which the forge always rejects).
+
+## Minor frontend issues (#401)
+
+`backend/gradient-web/src/endpoints/projects/auto_attach.rs`: `host_parsing_covers_url_shapes`,
+`self_hosted_pairs_inbound_and_outbound`, `public_github_matches_by_forge_type`,
+`ambiguous_inbound_is_skipped`, and `unrelated_forge_does_not_match` cover the
+repository-URL → org-integration matcher that auto-attaches a push trigger and a
+status-report action on project creation.
+
+`backend/gradient-forge/src/webhook.rs`: `github_push_extracts_commit_subject_and_author`,
+`github_push_without_head_commit_has_no_message`, and `gitlab_push_picks_commit_matching_after`
+cover push webhooks now writing the commit subject + author (previously only Pull/PR triggers did).
+
+## Draining server + board fixes (#411)
+
+`backend/gradient-types/src/waiting_reason.rs`: `draining_round_trip` asserts the
+new `WaitingReason::Draining` variant serialises to `kind: "draining"` and decodes
+back.
+
+`backend/gradient-db/src/draining.rs` (all on `MockDatabase`):
+`park_returns_rows_affected`; `unpark_touches_only_draining_parks` (a `Draining`
+park is recovered to `Queued` while a sibling capacity park is left untouched);
+`unpark_skips_update_when_no_draining_parks` (no UPDATE issued when nothing is
+parked).
+
+`backend/gradient-worker/src/worker_pool/eval_stats.rs`:
+`stats_env_enables_nix_show_stats_only_when_metrics_on` covers the eval-worker env
+that turns libnixexpr's thunk/function-call counters on (`NIX_SHOW_STATS`), the fix
+for thunks/fn-calls always reporting `0`.
+
+`frontend/src/app/features/board/health/health.component.spec.ts`: draining
+controls render "Enable Draining" with no banner when idle, "Disable Draining" with
+a banner when draining, and the button click calls `AdminService.setDraining(true)`.
+
+## Base workers (#115)
+
+`backend/gradient-db/src/` - `base_worker_db_helpers` tests cover inserting and querying `base_worker` rows, the `eval_gate` fallback (base workers bypass the per-org eval gate when `authorize_against` is set), and the `enabled` global flag filtering.
+
+`backend/gradient-proto/` - `base_worker_auth` tests cover the auth-challenge path for a base worker: wildcard `*` handshake succeeds, per-org scope is rejected when `authorize_against` forces a fixed identity, and a base worker with no connected orgs is rejected with an appropriate error.
+
+`backend/gradient-state/` - `state_validation` tests that a non-base worker with an empty `organizations` list fails validation, and that `base_worker = true` with an empty list is accepted. `state_provisioning` asserts that pre-enabled orgs listed under a base worker get `worker_registration` rows at provision time.
+
+`backend/web/` - `list_workers_includes_is_base` asserts the union query marks base-worker rows `is_base: true`; `patch_enable_disable_base_worker` verifies that org members can toggle a base worker on/off but PATCH with `display_name` or `enable_fetch` is rejected (405); `fire_test_endpoint` tests the `POST /orgs/{org}/workers/{id}/test` response shape for connected/disconnected and authorized/unauthorized states.
+
+`frontend/src/app/organizations/workers/` - `workers.component.spec.ts` covers rendering of `is_base` badge, the enable/disable toggle emitting the correct PATCH body, and that the edit/delete actions are absent for base-worker rows.
+
+`nix/tests/gradient/api` - E2E NixOS VM test provisions a base worker via state, calls `GET /orgs/{org}/workers` and asserts `is_base: true` in the response, then calls `POST /orgs/{org}/workers/{id}/test` and checks `ok: true`.
+
+## State export includes base workers (#405)
+
+`backend/gradient-state/src/export.rs` - `export_base_worker_emits_flag_orgs_and_authorize_against` asserts the exporter reconstructs a base worker as a `StateWorker` with `base_worker = true`, the `enabled` and `enable_*` gates, the stringified `authorize_against` UUID, and only the orgs linked via `organization_base_worker` (other base workers' links excluded); `token_file` stays blank because it cannot be recovered from the stored hash.
+
+## Scoring rule descriptions (#403)
+
+`backend/gradient-score/src/policy.rs` - `rule_catalog_covers_every_rule_with_a_description` asserts every `ScoreRule` in the superset policy appears once in `rule_catalog()` with a non-empty name and description, guarding against a new rule shipping without help text.
+
+`frontend/src/app/core/services/board.service.spec.ts` - `getScoringRules()` test verifies the catalog is fetched from `board/scoring/rules`, unwrapped from the response envelope, and cached so repeat subscribers do not refetch.
+
+## Worker CPU/RAM saturation penalty
+
+`backend/gradient-score/src/rules/resource.rs` - `ResourceSaturationRule` applies `-1000` to a real build dispatched to a worker whose live CPU usage is `>= 80%` (`>= 90%` for substitute-only `builtin` fetches) or whose free RAM is `<= 10%` of total, plus another `-1000` when the build's historical peak RAM x1.1 exceeds the worker's free RAM. Both stay below the `WaitTimeRule` cap so anti-starvation can still win eventually.
+- `saturation_penalizes_real_build_on_hot_cpu_or_ram_only` - a non-`builtin` build scores `-1000` on a CPU-hot or RAM-hot worker and `0` on an idle one.
+- `saturation_is_lenient_for_builtin_and_exempts_evals_and_no_metrics` - at `85%` CPU (between the two thresholds) a `builtin` fetch scores `0` while a real build scores `-1000`; eval jobs and workers reporting no metrics score `0` regardless of saturation.
+- `ram_prediction_exceeding_free_penalizes_and_stacks_with_saturation` - a build whose predicted peak RAM x1.1 exceeds free RAM scores `-1000`, `0` when it fits, and `-2000` when the worker is also saturated.
+
+## Wildcard attr tolerance + fair-share idle gate (#419)
+
+A wildcard (`*`/`#`) legitimately spans attrs that aren't buildable derivations, so a drvPath-resolution failure on a wildcard-matched attr is skipped silently; only an attr the user pinpointed exactly still surfaces the error. The `FairShareRule` penalty now applies only when every worker is busy, so a lone busy org is never penalized below the dispatcher's zero floor into leaving the cluster idle.
+
+- `backend/gradient-worker/src/executor/eval.rs`: `explicit_attr_set_keeps_only_wildcard_free_includes` asserts only wildcard-free, non-exclusion patterns count as explicit (quoted dots collapse to the discovered path form).
+- `backend/gradient-score/src/rules/fair_share.rs`: `idle_capacity_lifts_penalty` asserts a busy org is rationed when `idle_workers == 0` but not penalized when a worker is idle.
+
+The scheduler also keeps a bounded ring of recent dispatch decisions - every scored candidate, including the rejected/negative ones the dispatcher passed over - exposed at `GET /board/jobs/decisions` (superuser-only) and surfaced by a Live Jobs "incl. rejected" dropdown so operators can see all scores while tuning rules.
+
+- `backend/gradient-scheduler/src/jobs.rs`: `records_dispatch_decisions_including_rejected_candidates` asserts a worker that idles on a negative best score still records the decision with the rejected candidate and its negative score, and a later dispatch records a decision naming the winner.
+- `backend/gradient-scheduler/src/jobs.rs`: `terminal_job_removal_prunes_scores_across_all_workers` / `aborting_an_evaluation_prunes_its_pending_scores` guard the per-worker score map against the dispatch leak - completing, aborting, or eval-aborting a job now drops its recorded scores on every worker, so `take_best_of_kind`'s per-dispatch lookup stays bounded instead of growing with total dispatched jobs.
+- `frontend/src/app/features/board/live-jobs/live-jobs.component.spec.ts`: the decision-scores spec asserts the "incl. rejected" scope flattens decisions to candidate rows, marking the winner and showing negative-scored, passed-over candidates.
+- `backend/gradient-web/tests/board_decisions.rs`: `dispatch_decisions_rejects_non_superuser` and `dispatch_decisions_superuser_returns_empty_ring` guard the routing-tier fix - the handler needs `Extension<MUser>`, so the route must sit on the authenticated tier; on the optional-auth tier it returned `500` for every caller and the "incl. rejected" table stayed empty.
+
+## Bulk evaluation abort + dispatch race
+
+Aborting an evaluation parks it as `Waiting` with `WaitingReason::Aborting` before touching its builds, then aborts the eval's in-flight `derivation_build` anchors in a handful of set-based statements. Because anchors are global, an anchor is aborted only when no other non-terminal evaluation still needs it (a `build_job` in another live eval keeps it running); the dispatcher's queue finder skips `Waiting` evaluations meanwhile.
+
+- `backend/gradient-types/src/waiting_reason.rs`: `aborting_round_trip` asserts `WaitingReason::Aborting` serialises to `kind: "aborting"` and decodes back.
+- The anchor-abort SQL (set-based, shared-anchor guarded) is verified by E2E CI, not a MockDatabase sequence test.
+
+## Worker shadows base worker of same id (#407)
+
+`backend/gradient-web/src/endpoints/orgs/workers.rs` - `registration_shadows_base_worker_of_same_id` asserts `unshadowed_base_workers` drops a base worker whose `worker_id` matches one of the org's normal registrations, so `GET /orgs/{org}/workers` lists the conflicting worker only once (as the org registration). `delete_org_worker` deletes the registration first, so the normal worker is removed even when a base worker shares its id, and the `409` base-worker guard fires only when no registration exists.
+
+## Global derivation build identity (build-once anchors)
+
+A derivation is built exactly once across all evaluations and organisations.
+State lives on a `derivation_build` anchor (1:1 with the content-addressed
+`derivation`, `UNIQUE(derivation)`); each evaluation links to it through a
+per-eval `build_job`, and `Created → Queued` promotion is driven by the global
+`derivation_dependency` graph, decoupled from any single evaluation's
+completion (this is what fixes builds stuck in `Created` behind a
+never-completing eval). Promotion (`promote_ready`/`promote_dependents`) and
+`dispatch_ready_builds` are gated on reachability - an anchor is queued and
+dispatched only while some `build_job` references its derivation - so the
+per-derivation anchors seeded by `m20260619_020000` are never queued or
+dispatched without a driving evaluation (which previously logged "no driving
+evaluation for anchor"). The probe is backed by the `idx_build_job_derivation`
+index (`m20260620_000003`).
+
+The build-once guarantee is enforced by the DB `UNIQUE(derivation)` constraint
+plus `INSERT ... ON CONFLICT (derivation) DO NOTHING` in
+`scheduler::eval::resolve_anchors`, not by a MockDatabase test (which cannot
+exercise a real `ON CONFLICT`). The promotion SQL
+(`gradient_db::promotion::{promote_dependents, promote_ready,
+cascade_dependency_failed}`), its reachability gate, and the reachability
+refcount used for access and GC (`gradient_db::reachability`) are covered by
+E2E CI against real PostgreSQL.
+Worker-side, `backend/gradient-worker/src/executor/eval.rs` -
+`pushes_batch_closure_before_reporting_it` still guards that each batch's `.drv`
+runtime closure is pushed to the cache before the server promotes and dispatches
+that batch, so a build never prefetches a source the cache does not yet hold.
+
+The `m20260619_010000_globalize_derivation` migration collapses duplicate
+`(hash, name)` derivations onto the lowest-id survivor and re-points every FK.
+Every re-pointed junction table that carries a `UNIQUE` index over the
+derivation column - `derivation_output`, `derivation_dependency`,
+`derivation_closure`, `derivation_feature`, `cache_derivation` - must drop that
+index before re-pointing and rebuild it after collapsing the duplicate pairs;
+omitting one (e.g. `derivation_feature (derivation, feature)`) makes the
+re-point `UPDATE` violate the constraint when a duplicate and its survivor share
+a row. Verified by E2E CI applying the migration against real PostgreSQL.
+
+## PostgreSQL minimum-version guard (#387)
+
+`connect_db` reads `server_version_num` at startup and aborts before running
+migrations when the server is older than PostgreSQL 18, which the metric/stats
+rollups require (`uuidv7()`). `backend/gradient-db/src/connection.rs::pg_version_tests`
+covers the pure decision: `170_004`/`179_999` are rejected (with a `17.4`-style
+detected-version message) and `180_000`+ are accepted.
+
+## Migration start logging (#446)
+
+`run_migrations` in `backend/gradient-db/src/connection.rs` logs the pending
+migration count and names at `info` before calling `Migrator::up`, then logs
+completion, so a slow schema change is not mistaken for a hung process. No
+applied migrations logs `database schema up to date`. The behaviour depends on
+the live `seaql_migrations` table (after `install`/prune) so it is exercised at
+server startup, not via the MockDatabase unit harness.
+
 ## OIDC - CSRF cookie, ID-token verification, identity binding
 
 Tests in `backend/web/src/authorization/oidc.rs` cover the security
@@ -21,12 +291,28 @@ JWKS, `iss`/`aud`/`exp`/`nonce` checks, identity bound to
 `(oidc_issuer, oidc_subject)` rather than email) is enforced in
 `oidc_login_verify` and exercised end-to-end via the
 `/auth/oauth/authorize` and `/auth/oidc/callback` endpoints.
+
+`backend/web/tests/oidc_pkce.rs::authorize_redirect_carries_pkce_and_cookie_holds_verifier`
+asserts the login redirect carries `code_challenge` + `code_challenge_method=S256`
+and that the verifier stored in the signed `oidc_csrf` cookie hashes to that
+challenge (issue #318).
+
+`oidc.rs::tests::claimable_only_when_passwordless_and_unbound` covers account
+claiming (issue #319): a provisioned password-less, OIDC-unbound account is
+claimed on first login, while password-bearing or already-bound accounts are
+not.
+
+OIDC group → role mapping (issue #322) is covered by
+`core` `state::tests::resolves_group_to_org_role_grants` (declared `oidc_group`
+lists resolve to `(organization, role)` grants) and
+`oidc.rs::tests::collects_distinct_grants_for_presented_groups` (a user's group
+claims collect the distinct grants applied additively on login).
 ## Unified resource access - `crate::access` and `crate::permissions`
 
 All "load resource by name and check the caller may use it" logic lives in
 two modules:
 
-- `backend/core/src/permissions.rs` - declares the [`Permission`] capability
+- `backend/gradient-db/src/permissions.rs` - declares the [`Permission`] capability
   enum (e.g. `EditProject`, `ManageMembers`, `ManageRoles`, `ManageWebhooks`),
   each capability's stable bit position in the `role.permission` bitmask
   (`Permission::bit`), and the canonical bitmasks for the three built-in
@@ -134,16 +420,24 @@ Helper `filter_org_peers_without_cache` runs during the `/proto` handshake's
 `perform_auth` step. After token validation, each authorized peer that is an
 organization is checked against the `organization_cache` table. Organizations
 without a subscribed cache are moved into `failed_peers` with reason
-`"organization has no cache subscribed"`. If the authorized peer set ends up
-empty the connection is rejected with `401 no valid peer tokens provided`.
+`"organization has no cache subscribed"`. If the worker authenticated but the
+authorized peer set ends up empty solely because of missing caches, the
+connection is rejected with the dedicated `495 organization has no cache
+subscribed` instead of a misleading `401`; a `401 no valid peer tokens provided`
+is reserved for genuine token failures.
 
-Backend tests (in `backend/core/src/proto/handler/auth.rs`):
+Backend tests (in `backend/proto/src/handler/auth.rs`):
 
-- `proto::handler::auth::tests::filter_org_peers_passes_through_org_with_cache`
-- `proto::handler::auth::tests::filter_org_peers_demotes_org_without_cache`
-- `proto::handler::auth::tests::filter_org_peers_passes_through_non_org_uuids`
-- `proto::handler::auth::tests::filter_org_peers_mixed`
-- `proto::handler::auth::tests::validate_then_filter_demotes_org_without_cache`
+- `tests::filter_org_peers_passes_through_org_with_cache`
+- `tests::filter_org_peers_demotes_org_without_cache`
+- `tests::filter_org_peers_passes_through_non_org_uuids`
+- `tests::filter_org_peers_mixed`
+- `tests::validate_then_filter_demotes_org_without_cache`
+
+Auth-decision tests (in `backend/proto/src/handler/session.rs`):
+
+- `auth_decision_tests::registered_but_no_valid_token`
+- `auth_decision_tests::registered_emptied_by_missing_cache`
 
 ## Frontend - workers page no-cache banner
 
@@ -152,6 +446,44 @@ a banner instructing the admin to subscribe to a cache before workers can run.
 
 - `WorkersComponent - no-cache banner` - banner show/hide specs at
   `frontend/src/app/features/organizations/workers/workers.component.spec.ts`
+
+## Frontend - HTTP upstream Gradient-cache probe (#363)
+
+The "Add HTTP Upstream" dialog probes the entered substituter URL for
+`gradient-cache-info` to offer switching to the native Gradient protocol. The
+probe must only fire for real absolute URLs and only trust a genuine
+gradient-cache-info body, so a scheme-less input (which resolves to the SPA's
+own origin and returns a 200 `index.html`) no longer reports a Gradient cache.
+
+- `normalizeProbeUrl` / `isGradientCacheInfo` - pure-logic specs at
+  `frontend/src/app/features/caches/cache-upstreams/cache-upstream-probe.spec.ts`
+  (absolute http(s)-only URL gating; body must carry `GradientVersion` +
+  `GradientUrl`).
+- `CacheUpstreamsComponent - HTTP upstream probe` - wiring specs at
+  `frontend/src/app/features/caches/cache-upstreams/cache-upstreams.component.spec.ts`
+  (skips fetch for scheme-less input; suggests proto only on a valid body).
+
+## Frontend - evaluation builds search reveal
+
+The sidebar "Search builds" bar on the evaluation-log page is hidden by default
+and revealed with `/` (when not already typing) or Ctrl/Cmd+F while the sidebar
+holds focus; Escape closes it and resets the filter.
+
+- `isTypingTarget` - pure guard spec at
+  `frontend/src/app/features/evaluations/evaluation-log/keyboard.spec.ts`
+  (true for input/textarea/select/contenteditable so `/` is not hijacked while typing).
+- `EvaluationLogComponent - sidebar search visibility` - toggle specs at
+  `frontend/src/app/features/evaluations/evaluation-log/evaluation-log.component.spec.ts`
+  (open on `/` and focused Ctrl+F; closed otherwise; Escape resets).
+
+## Frontend - component style budget (#325)
+
+The `anyComponentStyle` budget in `frontend/angular.json` (`maximumWarning: 6kB`,
+`maximumError: 10kB`) is the regression guard for per-component CSS bloat:
+`ng build --configuration production` fails if any single component stylesheet
+compiles over 10 kB. Large stylesheets are split into cohesive region files via
+`styleUrls` (e.g. `evaluation-log.{component,sidebar,messages,log}.scss`) so each
+stays under the warning threshold.
 
 ## Auth middleware response envelope
 
@@ -213,7 +545,7 @@ Tests covered:
 **Deferred (Task 8):**
 
 The following scenarios are intentionally omitted because they would duplicate
-`trigger_evaluation` unit tests already present in `backend/core/src/ci/trigger.rs`:
+`trigger_evaluation` unit tests already present in `backend/gradient-ci/src/trigger.rs`:
 
 - *already_in_progress*: project has an in-progress eval → item appears in `skipped` with `reason="already_in_progress"`.
 - *no_previous_evaluation*: `trigger_restart_builds` finds no previous eval → `reason="no_previous_evaluation"`.
@@ -222,6 +554,27 @@ The following scenarios are intentionally omitted because they would duplicate
 These can be added as further `forge_hooks.rs` tests by extending the
 `MockDatabase` chain to return an in-progress evaluation row (or error) instead
 of the empty list at the in-progress-eval query position.
+
+## Native PR-review approval unpark (#369)
+
+A maintainer's approving PR review releases an approval-gated fork-PR run, the
+same as `/gradient approve` or the GitHub "Approve and Run" check action.
+`ParsedPullRequestReviewEvent::{from_github,from_gitea}`
+(`backend/gradient-forge/src/webhook.rs`) normalises the forge payloads;
+`handle_pull_request_review`
+(`backend/gradient-web/src/endpoints/forge_hooks/trigger.rs`) verifies the
+reviewer is a repo writer before unparking. GitLab is a no-op (no webhook on
+merge-request approval).
+
+Run with: `cargo test -p gradient-forge --lib webhook`
+
+| Test name | Scenario |
+|-----------|----------|
+| `github_review_approved_by_maintainer` | GitHub `pull_request_review` `submitted`/`approved` → `approved=true`, reviewer/PR/repo extracted. |
+| `github_review_changes_requested_is_not_approved` | `changes_requested` review → `approved=false`. |
+| `github_review_dismissed_is_not_approved` | `dismissed` action even with `approved` state → `approved=false` (only fresh approvals count). |
+| `gitea_review_approved_by_maintainer` | Gitea `reviewed` + `review.type=pull_request_review_approved` → `approved=true`. |
+| `gitea_review_rejected_is_not_approved` | Gitea `pull_request_review_rejected` → `approved=false`. |
 
 ## GitHub App manifest flow
 
@@ -256,6 +609,17 @@ Frontend (`pnpm --dir frontend exec ng test --include='**/github-app.component.s
 - `shows the setup view when ready=1 is absent`
 - `clicking create-button calls requestGithubAppManifest with host`
 - `renders credentials when ready=1 and the API returns them`
+
+## GitHub App setup cleanup (#457)
+
+Frontend (`pnpm --dir frontend exec ng test --include='**/health.component.spec.ts' --watch=false`):
+- `hides the "Set up GitHub App" link` - the System Health admin action is omitted once the App is configured.
+
+Frontend (`pnpm --dir frontend exec ng test --include='**/github-app.component.spec.ts' --watch=false`):
+- `allows leaving the setup view without prompting` - `canDeactivate()` returns true when no credentials are shown.
+- `prompts and blocks leaving when the user cancels` - `canDeactivate()` confirms and returns false while one-shot credentials are visible.
+- `prompts and allows leaving when the user confirms`.
+- `flags beforeunload while credentials are shown` - the `beforeunload` handler cancels the event so the browser warns before unload.
 
 ## Narinfo Deriver field
 
@@ -341,6 +705,95 @@ Backend (`cargo test -p worker --bins proto::nar::tests`):
 - `upload_presigned_fails_when_path_meta_unavailable` - same contract for
   the S3 / presigned-PUT branch.
 
+## Resumable NAR transfers (#225)
+
+Interrupted NAR transfers resume from a byte offset instead of restarting
+from 0, in both directions. Resume rests on byte offsets, the existing
+`NarUploaded.file_size` length check, and a `stream_token` guard (no content
+hashing). Receivers stage chunks to `*.partial` files; senders stay stateless
+and seek to the requested offset. `PartialStore` staging is synchronous
+`std::fs`, so both the server (push) and worker (pull) receivers run every disk
+op on `spawn_blocking` - otherwise the blocking I/O stalls the shared runtime and
+unrelated tasks (HTTP handlers on the server) hang during a transfer burst.
+End-to-end resume across a real reconnect is exercised by the NixOS VM suite in CI.
+
+Storage (`cargo test -p gradient-storage`):
+- `partial::tests` - `append_then_resume_reports_len`, `non_contiguous_append_errors`,
+  `token_mismatch_truncates_to_zero`, `discard_is_idempotent`,
+  `namespaced_key_creates_subdir`, `total_bytes_sums_partials`, `gc_zero_ttl_disabled`
+  cover the on-disk `PartialStore` (contiguous append, offset-0 restart, token guard,
+  GC).
+- `nar::tests::get_stream_from_*` - `NarStore::get_stream_from` returns the suffix from
+  an offset, equals the full object at 0, and yields an empty stream past the end.
+- `log::shard_tests::log_lives_in_two_char_shard_subfolder` - `FileLogStorage` writes
+  to `logs/<last-2-hex>/<uuid>.log` (e.g. `…8814fe` → `logs/fe/`) and `read`/`list_logs`
+  resolve through the shard.
+- `log::shard_tests::startup_migration_relocates_flat_entries` - constructing
+  `FileLogStorage` relocates pre-sharding flat `<uuid>.log` files and `<uuid>` chunk
+  dirs into their shard subfolder.
+
+Proto (`cargo test -p gradient-proto`):
+- `tests::nar_stream_header_client_roundtrip` / `nar_request_resume_roundtrip` /
+  `nar_stream_header_server_roundtrip` / `nar_push_resume_roundtrip` - rkyv
+  round-trip of the four additive resume messages.
+- `handler::socket::serve_nar_tests::serve_streams_full_payload_in_chunks` - the
+  server now emits a leading `NarStreamHeader` before the `NarPush` chunks.
+- `handler::dispatch::nar_receive_store_tests` - the disk-backed push receiver
+  (now `async`, offloading disk ops to `spawn_blocking`): contiguous append,
+  non-contiguous/overflow poisoning, cross-key budget, `note_header` resumable
+  prefix + token mismatch, presigned-mode detection, poison-clear retry, and
+  `finish` discard.
+
+Worker (`cargo test -p gradient-worker`):
+- `proto::nar_recv::tests::partial_store_resumes_across_reconnect` - a fresh
+  receiver over the same partial root resumes a download from the staged prefix.
+- `proto::nar_recv::tests::push_resume_gate_*` - the push-resume gate resolves
+  with the server offset and defaults to 0 when the server never answers.
+- `proto::nar::tests::trim_for_resume_skips_trims_and_passes` - the push-sender
+  skips/trims regenerated compressed parts to resume from an offset.
+
+## Fleet eval-cache pull/push handlers (#386)
+
+The server serves a flake's eval-cache SQLite blob by `fingerprint`, mirroring
+the NAR transfer: a pull returns `Miss`, a presigned-S3 GET URL, or an inline
+`EvalCacheChunk` stream; a push grants `Skip` (size-guarded so a stale-small
+blob never clobbers a larger one), a presigned PUT, or an inline upload. Blobs
+live under `eval-cache/<fingerprint>` in object storage; an `eval_cache_store`
+row indexes them and is upserted on the unique `fingerprint` index. Every
+handler is best-effort: any error logs and sends the safe negative response.
+
+Proto (`cargo test -p gradient-proto`):
+- `handler::eval_cache::tests` - pure decision helpers and inline staging:
+  `should_accept_push` size-guard (accept when no row / strictly larger, skip
+  when equal-or-smaller), `pull_outcome` selection (Miss / Presigned / Inline),
+  `push_mode` selection (Skip / Presigned / Inline), `storage_key` namespacing,
+  deterministic `stream_token`, and the in-memory `EvalCacheReceiveStore`
+  (contiguous append + finish, non-contiguous reject, over-budget reject,
+  chunk-needs-open-stream, single-active fingerprint resolution, token roundtrip).
+
+NixOS VM (`nix/tests/gradient/cache`):
+- Phase 5b asserts the worker's on-disk eval cache
+  (`/var/lib/gradient-worker/eval-cache/eval-cache-v6/*.sqlite`) grew past the
+  4096-byte empty SQLite header after an evaluation. Regression guard for the
+  cache being read/pushed while the eval worker is still alive, before nix
+  commits the `AttrDb` transaction, which left every pushed blob empty and every
+  flake re-evaluating cold.
+
+## Eval-cache eviction sweep (#386)
+
+A periodic server-side sweep bounds `eval_cache_store` by age and total size:
+rows older than `GRADIENT_EVAL_CACHE_MAX_AGE_DAYS` are evicted first, then -
+oldest-`updated_at` first - enough additional rows to bring the surviving total
+`size_bytes` at or under `GRADIENT_EVAL_CACHE_MAX_TOTAL_BYTES`. The pure
+`select_evictions` selector is unit-tested with fixed `NaiveDateTime`s (no wall
+clock); the DB/storage loop mirrors the proven sign-sweep and is covered by E2E.
+
+Cache (`cargo test -p gradient-cache`):
+- `cacher::eval_cache_sweep::tests` - `select_evictions`: empty input → empty;
+  under-budget + all fresh → empty; an over-age row evicted regardless of size;
+  over-cap evicts oldest-`updated_at` until under cap; age + size combine
+  without double-counting an id.
+
 ## Worker prefetch - re-derive `.drv` references from content
 
 When `prefetch_inputs` fetches a `.drv` during the closure walk, it harvests
@@ -383,7 +836,7 @@ The `derivation_output.file_hash`, `cached_path.file_hash`, and
 written while issue #132's BLAKE3 default was active) so the URL hash
 extracted from a narinfo `URL:` field matches the column directly.
 Workers send the prefixed hash over the wire; the proto handler and
-scheduler call `gradient_core::nix_hash::normalize_nar_hash` before
+scheduler call `gradient_util::nix_hash::normalize_nar_hash` before
 `Set(...)`. Migration `m20260430_000000_normalize_hash_columns` backfills
 pre-existing rows.
 
@@ -430,13 +883,17 @@ Backend (`cargo test -p core --test nar_extract`):
 
 ## Upstream narinfo metadata for worker prefetch
 
-Backend (`cargo test -p proto --lib handler::cache::tests`):
-- `parse_upstream_narinfo_full_fields` - verifies the server parses
+Backend (`cargo test -p gradient-core --lib upstream::tests`): the narinfo
+lookup/parse is shared by the cache-query handler (worker pulls) and the
+eval-time substitutability probe (scheduler), so it lives in `gradient-core`.
+- `parse_upstream_narinfo_full_fields` - verifies the parser reads
   `NarHash`, `NarSize`, `FileSize`, `References`, `Deriver`, and `Sig` from an
   upstream `.narinfo` body so the worker receives enough metadata to build a
   `ValidPathInfo` and call `add_to_store_nar`. Without this the worker
   silently failed imports and the build died with
   "dependency does not exist, and substitution is disabled".
+- `parse_upstream_narinfo_ca_field` - parses the `CA:` field so content-addressed
+  (fixed-output) paths import correctly.
 - `parse_upstream_narinfo_requires_url` - a narinfo without `URL:` is rejected.
 - `parse_upstream_narinfo_trims_base_url_trailing_slash` - joins
   `base_url` + `URL:` without double slashes.
@@ -445,7 +902,115 @@ Backend (`cargo test -p proto --lib handler::cache::tests`):
 - `parse_upstream_narinfo_ignores_unparseable_sizes` - malformed `NarSize` /
   `FileSize` fall back to `None` rather than aborting the parse.
 
-## Worker prefetch robustness - uncached inputs and broken daemon connections
+`compute_upstream_substitutable` flags an anchor `substitutable` only when every
+output is available on an **upstream** cache (`external_url`, set from a narinfo
+probe hit - upstream serves the whole closure). Internal cache presence
+(`is_cached`) is deliberately excluded: an output sitting in our store with an
+**incomplete** runtime closure (a dependency failed or was purged) would
+otherwise be flagged substitutable, fail substitution, and escalate into a build
+whose inputs were never produced - the `activate`/`unit-bird.service`
+`InputsUnavailable` loop. The genuinely-whole internal case is handled earlier by
+`is_truly_substituted` (gated on `closure_complete`, which resigns rather than
+dispatches). Exercised end-to-end by the cache integration test (the narinfo
+probe + DB writes have no MockDatabase harness); `derivations_all_outputs_available`
+covers the all-outputs-available predicate in isolation.
+
+## Re-offering re-queued jobs
+
+Backend (`cargo test -p gradient-scheduler --lib worker_pool`):
+- `remove_sent_candidate_allows_reoffer` - a re-queued build loses its
+  sent-candidate flag so the next delta push re-offers it (other jobs stay sent).
+  Backs the dispatch self-heal: re-queued/rejected jobs get scored a second time
+  and dispatch into free capacity instead of sitting unassigned. The worker-side
+  cache drop on reject and the loop's per-pass re-offer are covered end-to-end in
+  CI.
+
+## Upstream substitutability (eval-time lookup)
+
+Backend (`cargo test -p gradient-scheduler --lib upstream_substitutable_tests`):
+- `substitutable_only_when_all_outputs_available` - `derivations_all_outputs_available`
+  marks a derivation substitutable only when *every* one of its outputs is cached
+  somewhere (gradient cache or an upstream); a derivation with any output missing
+  is built. This is the all-or-nothing rule behind `compute_upstream_substitutable`.
+- `no_outputs_is_not_substitutable` - a derivation with no recorded outputs is
+  never substitutable.
+
+The full probe (`compute_upstream_substitutable`: org-scoped `.narinfo` lookup,
+persisting `derivation_output.external_url` + metadata, and `query()` serving the
+persisted URL without re-running narinfo) is covered end-to-end in CI - there is
+no real-Postgres/HTTP unit harness for it.
+
+## Eval BFS pruning honours substitutable closures
+
+Backend (`cargo test -p gradient-proto --lib prunable_known_derivations_tests`):
+- `prunes_outputs_available_anywhere_not_just_in_our_cache` - the
+  `QueryKnownDerivations` handler may prune a derivation's subtree only when its
+  full output set is fetchable without building: in our cache (`is_cached`, or
+  the output hash present in `cached_path`) or on a known upstream
+  (`external_url`). The regression it guards: keying the prune solely on
+  `is_cached` left the entire upstream closure (every output substituted, never
+  in our own cache) un-prunable, so the worker re-walked it on every evaluation.
+  A derivation with any output unavailable, no outputs, or no rows is not pruned.
+
+## Promotion gated on `edges_complete`
+
+`derivation_build.edges_complete` gates `promote_ready`, `promote_dependents`, and
+the `dispatch_ready_builds` readiness query. Anchors are created per-batch while an
+evaluation streams, but `derivation_dependency` edges are flushed in one pass at
+its completion - so an anchor left edge-less by a failed/aborted/restart-interrupted
+or still-running eval would otherwise look dependency-free and be dispatched without
+its inputs (`InputsUnavailable`, observed as `recorded_edges = 0` on a build that
+still needs inputs). `handle_eval_job_completed` calls `mark_edges_complete_for_eval`
+right after the flush; the flag is monotonic (edges are content-addressed, never
+rewritten), so a later `requeue_failed_anchors` keeps the anchor promotable without
+re-evaluation. It marks the eval's **full dependency closure**, not just its
+directly-reported `build_job`s: a transitive dep reached only via global edges
+(pruned or substituted in this eval, so no `build_job` here) would otherwise never
+get its flag maintained, and a prior demote that cleared it leaves the dep
+`edges_complete = false` forever - unpromotable behind the gate even though its edge
+set is complete and satisfied (observed live: `tzdata-2026b`, `edges_complete=f`, 0
+unmet deps, 30 build_jobs, blocking the `etc`->`activate`->`nixos-system` chain). A
+closure node is marked when it has recorded build edges or is one of this eval's own
+0-dep `build_job` leaves; ambiguous 0-edge transitive nodes stay gated. The
+graph-stuck heal (`attempt_graph_unstick`) re-runs it so an already-parked eval
+recovers without a re-trigger.
+The migration backfills existing rows complete unless they are `Created`, never
+dispatched, and have zero edges - the exact shape of an anchor stranded by an
+incomplete eval. The promotion/dispatch statements are raw SQL (no MockDatabase
+harness, per the backend test notes); covered end-to-end in CI.
+
+## Startup recovery aborts interrupted evals' anchors
+
+Backend (`cargo test -p gradient-db --lib recovery`):
+- `all_operations_populate_report` - `recover_interrupted_work` reports all five
+  recovery actions, including the new `builds_aborted`: the anchors driven by the
+  pre-build evals it aborts are themselves aborted (`abort_anchors_for_evals`),
+  mirroring the explicit-abort path so the server matches the builder, which
+  aborts the eval's builds when the server dies. The forced re-evaluation
+  re-drives them (`requeue_failed_anchors` resets `Aborted -> Created`).
+- `project_force_step_skipped_when_no_pre_build_evals` - with no in-flight
+  pre-build evals, the abort-anchors, abort-evals, and force-eval steps are all
+  skipped and `builds_aborted` stays 0. The shared-anchor exclusion (an anchor a
+  still-live eval also needs is left running) is raw SQL, covered E2E in CI.
+
+## External-cached substitution is a pure NAR relay (no store, no closure)
+
+A substitute build (`external_cached`) is done by `relay_external_cached_outputs`:
+for each output it `CacheQuery Pull`s the upstream narinfo (URL, `nar_hash`,
+`references`), downloads the **one** output NAR from upstream, decompresses +
+verifies it, recompresses to zstd (`nar::upload_presigned_bytes`), and pushes it
+straight into our cache via a presigned PUT - **without** `add_to_store_nar` or
+fetching the runtime closure. The previous path imported the output **plus its
+whole runtime closure** into the local nix store (`add_to_store_nar` requires every
+reference to be a valid store path), so any gap in the closure failed the import,
+surfaced as `SubstituteUnavailable`, and escalated into a real build that then died
+on `InputsUnavailable`. The closure no longer matters for the substitute itself:
+each closure member is mirrored by its own anchor, and the `closure_complete` gate
+orders dependents. A relayed output is therefore in our cache but not
+`closure_complete` until its closure is also mirrored - exactly what the gate
+expects. Covered end-to-end in CI (the relay needs a real upstream + object store,
+so there is no local unit harness); `nar::upload_presigned`'s helpers keep their
+existing tests.
 
 Backend (`cargo test -p worker --tests`):
 - `nix::store::tests::scoped_guard_discards_inner_when_not_marked_ok` -
@@ -473,6 +1038,160 @@ Backend (`cargo test -p worker --tests`):
   prefetcher abort with a clear message that names the missing path.
 - `proto::nar_import::tests::classify_empty_input_is_empty_output` - empty
   cache responses produce empty buckets.
+- `nix::store::tests::pool_config_connection_timeout_is_generous` - regression
+  for `acquire daemon connection: timeout: connecting to daemon`. The worker's
+  pool config must override harmonia's 10 s `connection_timeout` default, not
+  just `acquire_timeout`. Under a high daemon connection count the handshake
+  for a fresh pooled connection routinely outlasts 10 s, so the build failed an
+  otherwise-healthy prefetch import; the config now grants connection
+  establishment the same 10 min ceiling as the acquire wait.
+
+## Missing-input self-heal (#410)
+
+A build whose prefetch finds a required input absent from the cache no longer
+dies as an opaque permanent failure that recurs every evaluation. The worker
+classifies it as `BuildFailureKind::InputsUnavailable` and forwards the
+offending paths on `JobFailed.missing_paths`. The server then purges each
+path's stale cache artifact - deleting the `cached_path` row and clearing the
+output's `is_cached` / `cached_path` while leaving the derivation graph intact -
+so the next evaluation sees the output as never cached and rebuilds it from
+scratch. The failing build stays terminal for this eval (`InputsUnavailable` is
+permanent); the rebuild belongs to the next evaluation.
+
+Backend (`cargo test -p gradient-worker -p gradient-scheduler --tests`):
+- `proto::nar_import::tests::missing_inputs_message_and_downcast` - the typed
+  `MissingInputs` error renders the human message (count + first path) and
+  survives `anyhow` boxing, so the executor can `downcast_ref` it and forward
+  the exact paths to the server.
+- `build::retry_tests::inputs_unavailable_is_terminal_no_retry` -
+  `decide_failure_outcome(InputsUnavailable, ..)` is always `Permanent`: the
+  build fails this evaluation rather than burning the retry budget against an
+  input that will not appear until its producer is rebuilt.
+- `build::retry_tests::store_path_hash_extracts_32_char_hash` - the helper that
+  maps a missing `/nix/store/<hash>-<name>` path to the `derivation_output`
+  hash used to purge its cache artifact.
+- `proto::nar_import::tests::presigned_404_410_are_missing_inputs_other_statuses_retry` -
+  a presigned S3 download that 404/410s is reclassified as a missing input
+  (the bucket lost an object the DB still claims), while 403/429/5xx stay
+  retryable transport errors. The server never sees this since it only signs
+  the URL, so the worker is the one that triggers the self-heal.
+- `proto::nar_import::tests::presigned_retryable_statuses_are_timeout_rate_limit_and_5xx` -
+  `presigned_status_is_retryable` returns true for 408/429/5xx and false for
+  400/403/404/410. `download_by_url` now bounds presigned downloads to
+  `PREFETCH_CONCURRENCY` and retries each one (`download_one_presigned`,
+  `PRESIGNED_DOWNLOAD_MAX_ATTEMPTS` with exponential backoff) on transport
+  errors and retryable statuses, so a flaky object store (`tls handshake eof`
+  under unbounded concurrent connections) no longer fails the whole build's
+  prefetch. 404/410 still surface immediately as `MissingInputs`.
+
+The purge path itself (`gradient_db::demote_cached_output`) deletes the
+`cached_path` row (its `cached_path_signature` rows cascade; the
+`derivation_output` FK is `ON DELETE SET NULL`), deletes the NAR object, and is
+shared with the NAR-serve self-heal in `socket.rs`. It also **resets the
+producing anchor** from terminal-success (`Completed`/`Substituted`) back to
+`Created` (`substitutable`/`substituted` cleared, `attempt = 0`): the artifact is
+gone, so the build-once "succeeded" invariant no longer holds, and `resolve_anchors`
+never re-queues terminal-success anchors. Without the reset a producer whose NAR
+was demoted/zombie-purged stays "succeeded" forever and every dependent fails
+`InputsUnavailable` indefinitely (e.g. `search-meta` missing a `nixpkgs--.json`
+input). `demote_deletes_the_nar_object` covers the `.drv` (no-producer) path; the
+anchor reset is raw SQL like `requeue_failed_anchors` and is exercised end-to-end
+in CI (the db crate has no real-Postgres unit harness).
+
+The cache is closure-complete by invariant: `compress_and_push_paths` pushes each
+output's full runtime closure (`collect_runtime_closure`), not just the output, so
+a referenced source (`-source`) can never be stranded uncached while its referrer
+is cached. The invariant is **enforced at dispatch** via `derivation_build.closure_complete`:
+a **built** anchor is complete once its outputs are cached, its edges are flushed,
+and every build dependency is itself `closure_complete` **or** `substitutable`
+(closure fetchable from upstream). A build's runtime refs are a subset of its build
+inputs, so a fetchable build closure implies a fetchable runtime closure - closing
+the runtime-vs-build-time edge gap (`unit-bird.service` via `system-units`) without
+a runtime walk. `propagate_closure_complete` (from `update_derivation_build_status`
+at terminal success, **before** promoting) computes it over `derivation_dependency`
+and **ripples up**: it marks the just-finished anchor, then re-checks that anchor's
+dependents, etc. The up-ripple is load-bearing - a dependent that finished before
+its dependency did would otherwise never re-evaluate its completeness, and earlier
+the VM test stalled `Building -> Waiting` for exactly this. A **substituted** anchor
+is deliberately not marked complete (we hold only its output NAR, not its build
+closure); dependents reach it through `substitutable`. `promote_ready` /
+`promote_dependents` / `dispatch_ready_builds` gate each dependency on
+`(terminal-success AND closure_complete)` **or** `substitutable`.
+
+`propagate_closure_complete` only fires on a fresh completion event, so anchors
+that completed under older code never get the build-edge flag and would strand
+their dependents in `Created` with no error to trigger a reactive heal.
+`reconcile_closure_complete` (global fixpoint, run at eval completion before
+`promote_ready`) closes that gap: it re-applies the same gate to every unflagged
+built anchor, converging bottom-up in O(longest unmarked chain); a converged
+graph costs one zero-row statement. The same fixpoint unsticks a live instance
+manually via a single `DO` loop over `derivation_build`.
+
+Out-of-order substitution (#456): a `substitutable` anchor (NAR on an upstream
+cache) skips the dependency gate entirely in all three of `promote_ready` /
+`promote_dependents` / `dispatch_ready_builds` - it needs neither its build
+dependencies nor its runtime closure in our cache, since the worker fetches the
+output plus closure from upstream on demand (never the `.drv`'s build-time
+`input_sources`). The substitute job carries empty `required_paths`, so the worker
+pulls no build deps and every worker scores it a uniform zero. The gate rewrites
+are exercised end-to-end in CI (no real-Postgres unit harness); `decide_dispatch_
+mode` unit tests still cover the substitute/escalate/stall decision.
+
+Self-heal clears the flag so the gate re-blocks: a reported-missing leaf with a
+producer is purged + rebuilt and `clear_closure_complete_for_referrers` drops
+`closure_complete` up the (transitive) referrer chain without deleting healthy
+NARs; a producerless source demotes its direct referrers (`demote_referrers_of`)
+so a referrer rebuild re-pushes it. A third case is the **orphan producer**: the
+missing leaf has a producing derivation, but the eval pruned it out of the build
+graph (a referrer's output was cached without its closure under output-only
+substitution), so it carries no `build_job` and promotion can never queue it - the
+gentle flag clear leaves the referrer cached, pruned, and never re-walked.
+`reconcile_missing_inputs` detects this (`derivation_is_reachable` false for the
+demoted producer) and demotes the referrers so the next eval re-walks them,
+re-records the dropped `derivation_dependency` edge, and schedules the orphan.
+`demote_cached_output` leaves `edges_complete` intact - it deletes the
+`cached_path`, so the uncached output is re-walked by the next eval regardless
+(uncached nodes are never pruned), and clearing the flag would only strand a
+complete-edge node (e.g. a shared dep `tzdata` swept up by the absent-orphan
+recovery) behind the closure gate until that re-walk, which manifests as a
+`graph_stuck` deadlock. Reproduced live: a
+crane `vendor-cargo-deps` was `Completed`/`closure_complete` with only 2 of its
+edges recorded, its `vendor-registry` dependency a 0-edge/0-`build_job` orphan, so
+`gradient-server-deps` dispatched and the prefetch closure-walk died
+`InputsUnavailable` on the orphan's output.
+
+The fourth and self-healing case is the **absent orphan**: the missing input has
+no producer row *and* no indexed referrer (pruned out so thoroughly it was never
+recorded, or its rows were deleted by an admin), so it cannot be reached upward -
+`demote_referrers_of` finds nothing. `reconcile_missing_inputs` flags this
+(`needs_dep_rewalk`) and reaches it downward from the known failing build:
+`demote_output_only_cached_deps` demotes that build's output-only-cached direct
+dependencies (`cached_path.file_hash` present, `external_url` NULL), so the next
+eval re-walks them and re-records the orphan plus its now-buildable subtree.
+Upstream deps (`external_url`) are left intact - a real upstream serves their
+closure. This is what lets an accidental cache-row deletion recover on the next
+evaluation instead of needing a manual reset; reproduced live with
+`cargo-package-lzma-sys-0.1.20`, which had no `derivation`/`derivation_output`/
+`cached_path_reference` rows at all. Exercised end-to-end in CI (the db crate has
+no real-Postgres unit harness). References are fully normalized into `cached_path_reference` (one row per referrer
+-> referenced store path, with `reference_hash` for indexed lookup and `position`
+for stored order); the `cached_path.references` text column is dropped. Referrer
+lookups (`referrers_of_hash`) and the runtime-closure walks become exact index
+scans instead of a `references LIKE '%hash%'` full-table scan, and the narinfo
+`References:` line plus the signature fingerprint reconstruct verbatim via
+`references_for_hash` (`ORDER BY position`) - the worker sends references in nix
+`StorePathSet` order, so `position` preserves the exact bytes the signature
+covers. The migration backfills the flag to a fixpoint over the existing cache and
+resets closure-incomplete terminal anchors so they rebuild. The closure marker, gate, reference index, and
+migration backfill are exercised end-to-end in CI (the db crate has no
+real-Postgres unit harness).
+
+Preventively, `expand_substituted_closure` now only marks a closure dep
+`Substituted` when its `derivation_output` rows are all `is_cached = true`;
+otherwise it inserts a `Created + substitutable = true` build so the dep
+substitute-attempts and escalates to a real build on a miss. The `cached` flag
+is computed in the recursive-CTE query and is covered by E2E CI (the scheduler
+has no real-Postgres unit harness for raw SQL).
 
 ## State configuration - optional fields for OIDC-only users
 
@@ -498,27 +1217,35 @@ Backend (`cargo test -p core --lib state::tests`):
   `types.ints.positive` constraint in `nix/modules/gradient-state.nix`
   and the API-level `apply_keep_evaluations` check.
 - `default_keep_evaluations_is_thirty`
-  (`backend/core/src/types/cli/storage.rs`) - `StorageArgs::default()`
+  (`backend/gradient-types/src/cli/storage.rs`) - `StorageArgs::default()`
   yields `keep_evaluations = 30` so a default `gradient-server` install
   bounds per-project evaluation retention instead of allowing unbounded
   growth (issue #92).
 - `default_nar_ttl_hours_is_two_weeks`
-  (`backend/core/src/types/cli/storage.rs`) - `StorageArgs::default()`
+  (`backend/gradient-types/src/cli/storage.rs`) - `StorageArgs::default()`
   yields `nar_ttl_hours = 336` (2 weeks) so cached NARs eventually
   expire on a default deploy (issue #92).
 - `clap_default_keep_evaluations_is_thirty`
-  (`backend/core/src/types/cli/storage.rs`) - parsing an empty argv
+  (`backend/gradient-types/src/cli/storage.rs`) - parsing an empty argv
   through clap yields `keep_evaluations = 30`, guarding against drift
   between the `#[arg(default_value …)]` attribute and the `Default`
   impl.
 - `clap_default_nar_ttl_hours_is_two_weeks`
-  (`backend/core/src/types/cli/storage.rs`) - parsing an empty argv
+  (`backend/gradient-types/src/cli/storage.rs`) - parsing an empty argv
   through clap yields `nar_ttl_hours = 336`, same drift guard.
 - `state_project_silently_ignores_legacy_force_evaluation_field` -
   state files written before the rename may still carry
   `force_evaluation`; serde's default unknown-field handling drops it
   silently so existing deployments parse cleanly after the field's
   removal from the schema.
+- `state_org_accepts_explicit_id` / `state_org_id_defaults_none` -
+  `StateOrganization.id` deserialises from a UUID string and defaults to
+  `None`, so a declarative deployment can pin the org UUID a worker's
+  `peersFile` references (`<org_id>:<token>`) (issue #333).
+- `state_org_validator_rejects_malformed_id` - a non-UUID `id` yields a
+  validation error pinpointing `organizations.<org>.id`.
+- `state_org_validator_rejects_duplicate_ids` - two organizations
+  declaring the same `id` is an error.
 - `state_org_members_serde_round_trip` - `StateOrganization.members`
   round-trips through JSON as `[{ user, role }]` entries, covering both
   built-in (`Write`) and custom (`releaser`) role names.
@@ -542,12 +1269,12 @@ Backend (`cargo test -p core --lib state::tests`):
   member entries with the same `user` in one org's `members` is an
   error.
 - `pending_membership_tests::apply_pending_returns_zero_for_unknown_user`
-  (`backend/core/src/state/provisioning.rs`) -
+  (`backend/gradient-state/src/provisioning.rs`) -
   `apply_pending_org_memberships` is a no-op when the username has no
   pending entries; callable from any user-creation path without a
   matching state declaration.
 - `keep_set_tests::keep_sets_track_inner_name_not_attrset_key`
-  (`backend/core/src/state/provisioning.rs`) - `gradient-state.nix`
+  (`backend/gradient-state/src/provisioning.rs`) - `gradient-state.nix`
   exposes `name = mkOption { default = <attrset key>; }` on users,
   organizations, projects, caches, and API keys, so a user may pin
   `projects.foo = { name = "main"; … }`. Every `apply_*` writes the
@@ -558,11 +1285,127 @@ Backend (`cargo test -p core --lib state::tests`):
 
 These pin the wire contract between `nix/modules/gradient-state.nix`
 (`types.nullOr types.str` on `password_file` and the three `description`
-options) and `backend/core/src/state/mod.rs`. Without them, provisioning a
+options) and `backend/gradient-state/src/mod.rs`. Without them, provisioning a
 user intended for OIDC failed at startup with "missing field
 `password_file`", and the user's subsequent OIDC login was rejected by
 `web::authorization::oidc` with `User already exists with password
 authentication`.
+
+## Reporter trigger rejects outbound integration (#326)
+
+Backend (`cargo test -p core --lib state::provisioning::trigger_helper_tests`):
+- `build_reporter_pr_rejects_outbound_integration_with_kind_aware_error` -
+  a `reporter_pull_request` / `reporter_push` trigger referencing a name that
+  exists only as an `outbound` integration now fails with a kind-aware error
+  naming both `inbound` and `outbound`, instead of the misleading
+  `unknown integration` raised when the name genuinely doesn't exist. Reporter
+  triggers resolve against inbound integrations only (the webhook resolver
+  matches the inbound id), so pointing one at an outbound integration would
+  otherwise persist an id no webhook ever resolves to and the trigger would
+  silently never fire.
+
+## Integrations apply before projects, validated at build time (#332)
+
+Backend (`cargo test -p core --lib state::tests`):
+- `state_reporter_trigger_accepts_declared_inbound_integration` - a
+  `reporter_push` trigger naming a declared inbound integration in the same
+  org passes validation.
+- `state_reporter_trigger_rejects_unknown_integration` - a reporter trigger
+  naming an integration that is not declared yields a
+  `projects.<project>.triggers` validation error, surfacing the mistake at
+  build/`--validate-state` time instead of mid state-apply.
+- `state_reporter_trigger_rejects_outbound_integration` - a reporter trigger
+  pointing at an `outbound`-kind integration is rejected (reporters resolve
+  against inbound integrations only).
+- `state_reporter_trigger_accepts_github_app_name` - the reserved `github`
+  integration name needs no explicit declaration (auto-managed GitHub App row).
+
+The apply order in `apply_state_to_database` now runs `apply_integrations`
+before `apply_projects` so trigger/action integration lookups resolve against
+rows already in the DB.
+
+## `--validate-state` parses without secret files
+
+Backend (`cargo test -p core --lib types::cli::secrets::tests`):
+- `validate_state_parses_without_secret_files` - `--state-file ... --validate-state`
+  parses with no `--crypt-secret-file`/`--jwt-secret-file`, so the secret-free Nix
+  build/CI check (`services.gradient.validateState`) runs without provisioning secrets.
+- `secret_files_parse_from_flags` - the live-server path still accepts both secret
+  flags; `init_state` rejects an empty value before startup.
+
+## Scheduler does not double-dispatch a build
+
+Backend (`cargo test -p scheduler --lib jobs::tests::add_pending_does_not_requeue_active_job`):
+- `add_pending_does_not_requeue_active_job` - once a build is assigned (moved to
+  `active`), re-adding the same job id must not put it back in `pending`. Two
+  concurrent `dispatch_ready_builds` passes can both clear the `contains_job`
+  filter before either enqueues; without the idempotency guard the same build is
+  dispatched to the worker twice, the duplicate is aborted by the nix daemon
+  ("build aborted by server"), and the spurious failure fails the whole
+  evaluation (observed flaking the `gradient-cache` NixOS VM test).
+
+## Cross-architecture substitutable-build scheduling
+
+Backend (`cargo test -p gradient-scheduler --lib dispatch_mode::tests`):
+- `non_substitutable_is_real_arch` / `substitutable_under_threshold_is_builtin` / `escalates_only_when_arch_worker_present` / `stalls_when_budget_spent_and_no_arch_worker` / `arch_available_builtin_always_true` - verify `decide_dispatch_mode` and `arch_available` for the (substitutable, miss_count, threshold, arch_has_worker) combinations.
+
+Two retry-scoping changes make a *new* evaluation a fresh build intent against
+the global, build-once anchor (covered E2E in CI; the SQL is not MockDatabase-
+testable):
+- `substitute_miss_counts` (`gradient-db/src/build_attempt.rs`) is keyed by
+  `(anchor, evaluation)` via the attempt's `build_job`, so a new eval starts the
+  substitute-miss budget at zero instead of inheriting a previous eval's
+  exhausted budget and escalating straight to a build. Dispatch and the parker's
+  `BuildabilityChecker` both look up the count for their driving evaluation.
+- `requeue_failed_anchors` (`gradient-db/src/promotion.rs`), called from
+  `resolve_anchors`, resets anchors a previous eval left terminal-failed
+  (`FailedPermanent`/`Aborted`/`DependencyFailed`/`FailedTimeout`) back to
+  `Created` for the new eval's derivations, so a permanent failure is retried
+  rather than poisoning every later eval that needs the derivation. Build-once
+  success (`Completed`/`Substituted`) is never reset.
+
+Backend (`cargo test -p gradient-db --lib build::tests`):
+- `maps_returned_rows_to_id_set` / `empty_input_returns_empty_set` - plumbing tests for `builds_with_satisfied_deps` (the SQL antijoin itself is covered end-to-end in CI).
+
+Backend (`cargo test -p gradient-scheduler --lib build::tests`):
+- `stalled_substitute_is_not_buildable_and_appears_in_unmet` - when a build's substitutable derivation has too many misses, the parker does not mark it buildable and the reason reflects the escalation.
+- `dependency_blocked_build_is_not_buildable` - a build waiting on an unsatisfied dependency is not buildable regardless of dispatch mode.
+- `substitutable_within_budget_is_buildable_anywhere` - a substitutable build under the miss threshold is buildable on any worker with the derivation's architecture.
+
+## Org members can view subscribed caches (#327)
+
+NixOS VM (`nix/tests/gradient/state`):
+- `org member can view subscribed caches they do not own` - a state-provisioned
+  cache appears in `GET /caches` for any member of a subscribed organization,
+  so viewing it by name (`GET /caches/{cache}`, `gradient cache show`) must
+  succeed too. `bob` (a plain `corp` member who created none of the caches and
+  holds no cache membership) lists and shows both the active `main` and inactive
+  `dev` caches. Regression: detail lookups previously required a direct
+  `cache_user` row, so org members got a 404 via the API, CLI and WebUI.
+- `non-members cannot see private caches` - `charlie`, who belongs to no
+  subscribing org, neither lists nor can show the private caches, pinning the
+  broadened read access so it does not leak caches to unrelated users.
+
+## Org members get read-only cache access (#334)
+
+Backend (`cargo test -p web --lib access::tests`):
+- `effective_cache_mask_returns_role_for_member` - a direct cache member's API
+  key is capped by their cache role mask.
+- `effective_cache_mask_returns_view_for_org_subscriber` - a member of a
+  subscribed organization with no `cache_user` row is treated as read-only
+  (`cache_view_mask`), so they can mint a read-only cache key and view stats.
+- `effective_cache_mask_none_for_outsider` - a user with neither a cache role
+  nor a subscribing org gets no mask, so cache-pinned key creation 404s.
+
+These pin the fix for the remaining "cache not found" responses: creating a
+read-only cache API key (`POST /user/keys`) and reading cache traffic/storage
+metrics (`GET /caches/{cache}/stats`) now route through the same
+member-or-subscriber visibility as `GET /caches/{cache}`, instead of requiring
+`ManageCacheMembers` / cache ownership.
+
+Integration (`cargo test -p web --test cache_api_key_pinning`):
+- `create_cache_pinned_key_cannot_exceed_member_mask` - a View-mask member is
+  denied a `writeStore` cache-pinned key (perms beyond their mask) → 403.
 
 ## Hashed API keys at rest
 
@@ -671,6 +1514,44 @@ Backend (`cargo test -p scheduler --tests scheduler_tests::record_eval_message`)
   into `evaluation_message`. Build compile failures and user-initiated aborts
   deliberately do not flow through this path.
 
+## Scheduler job-notify is level-triggered (#359)
+
+Backend (`cargo test -p scheduler --tests scheduler_tests::job_notify_bump_is_not_lost_when_not_awaiting`):
+- An `enqueue_*_job` that bumps `Scheduler::job_notify` while no session is
+  awaiting `changed()` is still observed on the next check (`has_changed()` is
+  `true`). Guards against the regression where an edge-triggered
+  `Notify::notify_waiters()` dropped wakeups fired during NAR/job traffic,
+  starving deep build chains of `JobOffer`s and timing out the cache VM test.
+- `dispatch_kick_is_retained_when_not_awaiting` - a `kick_dispatch()` fired
+  while the dispatch loop is mid-pass is retained (`notify_one` permit) and woke
+  on the next iteration, so serial chains advance at completion speed rather than
+  one level per 5s tick.
+- `worker_pool::tests::test_assign_and_release_job` - `release_job` reports the
+  worker idle only after its last in-flight job is released, so the dispatch kick
+  fires for a now-idle worker (serial chain) but not while it is still building
+  (e.g. 1 of 8 done).
+- `worker_pool::tests::reregister_preserves_reported_capabilities` - a reconnect
+  or server-initiated re-auth re-registers a worker, but architectures/features/
+  sizing arrive once per session via a separate `WorkerCapabilities` message the
+  worker need not re-send. `register` must carry the prior slot's reported
+  capabilities over; otherwise the slot resets to empty architectures,
+  `can_build` rejects every real-arch job, and builds queue forever against an
+  idle worker (eval parked `Waiting` with a stale, empty-`unmet` reason).
+
+## Push-mode signature placeholders - insert-select, FK-race-safe
+
+`ensure_push_signatures` (`backend/gradient-proto/src/handler/cache.rs`) creates
+one `cached_path_signature` placeholder per (cached_path, org cache) pair when a
+worker connects in Push mode - a cartesian product over the worker's whole store.
+It inserts via `INSERT ... SELECT FROM cached_path ... CROSS JOIN unnest(caches)`
+keyed on `cp.id = ANY($paths)`, so a path concurrently purged (demote/GC) between
+the worker's CacheQuery and this insert is simply skipped rather than violating
+the `fk-cached_path_signature-cached_path` foreign key and failing the whole
+batch. Array params keep each statement to two binds regardless of row count
+(no 65 535-param cap concern); the path list is chunked at `SIGNATURE_PATH_BATCH
+= 8000` only to bound statement size for large stores. Verified by E2E CI
+(MockDatabase cannot exercise the FK race).
+
 ## Cache GC - orphan files keep predicate
 
 `cleanup_orphaned_cache_files` (`backend/cache/src/cacher/cleanup.rs`) is the
@@ -720,6 +1601,55 @@ and zero remaining build references.
   regression for #107: the TTL SELECT must keep its `derivation_output.ca
   IS NOT NULL` guard so FOD NARs are never evicted by the TTL pass.
 
+## Per-project evaluation GC retention policy (#305)
+
+`evaluations_to_gc` (`backend/gradient-db/src/gc.rs`) decides, by index into a
+newest-first evaluation list, which evaluations `gc_project_evaluations`
+deletes for a project's `keep_evaluations` count. Active evaluations
+(Queued/Fetching/Evaluating*/Building/Waiting) are never deleted and never
+consume a `keep` slot; among terminal evaluations the `keep` most recent
+`Completed`/`Failed` ("done") are retained, and `Aborted` evaluations are
+retained only to fill remaining slots when too few done evaluations exist.
+This fixes #305 where a building/queued evaluation consumed the single keep
+slot and the last successful evaluation was deleted.
+
+- `core::db::gc::tests::keeps_last_done_when_newer_evaluation_is_active` -
+  `keep = 1` with a newer active evaluation deletes nothing.
+- `core::db::gc::tests::never_deletes_active_evaluations` - an all-active
+  list is never touched regardless of `keep`.
+- `core::db::gc::tests::gcs_aborted_when_a_done_evaluation_exists` - a newer
+  `Aborted` is deleted in favour of an older `Completed`.
+- `core::db::gc::tests::keeps_aborted_when_no_done_evaluation_exists` - a
+  lone `Aborted` is retained when no done evaluation exists.
+- `core::db::gc::tests::done_evaluations_take_priority_over_aborted` - done
+  evaluations fill `keep` slots ahead of `Aborted` ones.
+- `core::db::gc::tests::deletes_done_evaluations_beyond_keep` - done
+  evaluations past `keep` are deleted.
+- `core::db::gc::tests::active_evaluations_do_not_consume_keep_slots` - an
+  active evaluation does not occupy a slot, so the newest done evaluation
+  is retained.
+- `core::db::gc::tests::keep_zero_deletes_nothing` - `keep = 0` is a no-op.
+
+## Orphan derivation GC - race-safe delete + NAR reclaim
+
+`gc_orphan_derivations` (`backend/gradient-db/src/gc.rs`) reclaims global,
+content-addressed `derivation` rows that no surviving evaluation needs. Because
+a derivation is reused across evaluations, a concurrent eval can re-attach a
+`build_job` to a past-grace orphan between selection and deletion, so the pass
+deletes rows with an in-statement `NOT EXISTS (build_job)`/`NOT EXISTS
+(entry_point)` re-check and `RETURNING`, then reclaims NARs keyed strictly to
+the rows actually deleted. This fixes the `build_job_derivation_fkey` violation
+seen after the globalize-derivation migration and the latent corruption where a
+re-referenced derivation was left pointing at an already-deleted NAR.
+
+- `gc::tests::reclaims_only_hashes_no_survivor_references` - a hash shared by a
+  surviving `derivation_output` (e.g. a fetchurl source tarball) keeps its NAR;
+  only the unshared hash is reclaimed.
+- `gc::tests::reclaims_nothing_when_all_hashes_survive` - every deleted hash
+  still referenced means no NAR is removed.
+- `gc::tests::reclaims_all_when_no_survivors` - no surviving reference means all
+  deleted hashes are reclaimed.
+
 ## Frontend - form primitives & style guide
 
 Reusable form primitives live under
@@ -759,8 +1689,8 @@ Specs (vitest + jsdom):
 CI check names reported to GitHub/Gitea now include the organization
 and project so multiple Gradient instances/projects sharing a forge
 repository remain distinguishable. Helpers live in
-`backend/core/src/ci/reporting.rs` and are reused by the
-`ForgeStatusReport` action dispatcher (`backend/core/src/ci/actions.rs`):
+`backend/gradient-ci/src/reporting.rs` and are reused by the
+`ForgeStatusReport` action dispatcher (`backend/gradient-ci/src/actions.rs`):
 
 - Evaluation roll-up: `Gradient Evaluation {org}/{project}` (e.g.
   `Gradient Evaluation wavelens/my-project`).
@@ -808,7 +1738,7 @@ Tests (`cargo test -p web --test rate_limit`):
 
 ## Outgoing webhook URL - SSRF validation
 
-`validate_webhook_url` (in `backend/core/src/ci/webhook.rs`) is the gate
+`validate_webhook_url` (in `backend/gradient-util/src/http_validation.rs`) is the gate
 between user-supplied webhook URLs and the outbound HTTP client. It is
 called at create/update time (in `web::endpoints::webhooks::{put,
 patch_webhook}`) and again at delivery time inside
@@ -850,7 +1780,7 @@ Unit tests (`cargo test -p core --tests ci::webhook`):
 ## CI reporter base URL - SSRF + redirect token leak (#113)
 
 `GiteaReporter`, `GithubReporter`, and `GithubAppReporter` (in
-`backend/core/src/ci/reporter.rs`) now validate any user-supplied
+`backend/gradient-forge/src/reporter.rs`) now validate any user-supplied
 `base_url` / `api_base_url` through the same SSRF gate as outgoing
 webhooks (`validate_webhook_url`), and build their reqwest clients with
 `redirect::Policy::none()` so that an attacker cannot pivot a status
@@ -858,7 +1788,7 @@ POST to an internal endpoint and leak the integration token via a
 3xx `Location:` header. `reporter_for_project` continues to fall back
 to `NoopCiReporter` when construction fails, with a `warn!` log.
 
-Unit tests (`cargo test -p core --tests ci::reporter`):
+Unit tests (`cargo test -p core --tests forge::reporter`):
 
 - `gitea_reporter_rejects_aws_metadata_ip` /
   `github_reporter_rejects_aws_metadata_ip` /
@@ -880,19 +1810,35 @@ Unit tests (`cargo test -p core --tests ci::reporter`):
   Gitea base URL plumbed through the factory degrades to
   `NoopCiReporter` rather than crashing the caller.
 
+## Forge provider registry
+
+Every per-forge decision (reporter construction, webhook parsing,
+signature verification, event classification) lives behind the
+`ForgeProvider` trait in `backend/gradient-forge/src/`; the `ForgeRegistry`
+maps each `ForgeType` to its provider and is shared via `CiContext.forge`.
+Reporter selection and webhook dispatch resolve a provider instead of
+matching on `ForgeType`.
+
+Unit tests (`cargo test -p core --tests forge::providers`):
+
+- `gitlab::tests::{matches_token_exactly, rejects_mismatched_token,
+  rejects_missing_token}` - constant-time `X-Gitlab-Token` equality.
+- `gitea::tests::rejects_missing_signature` - empty `X-Gitea-Signature`
+  is rejected.
+
 ## GitLab outbound CI reporter (#90)
 
-`GitlabReporter` (in `backend/core/src/ci/reporter.rs`) posts commit
+`GitlabReporter` (in `backend/gradient-forge/src/reporter.rs`) posts commit
 statuses to GitLab via `POST {base_url}/api/v4/projects/{id}/statuses/{sha}`,
 where `id` is the URL-encoded `owner/repo` path (also covers nested
 groups such as `group/sub/repo`). Authenticates with `PRIVATE-TOKEN`,
 which accepts personal, project, and group access tokens. The
-`ForgeStatusReport` action dispatcher in `backend/core/src/ci/actions.rs`
+`ForgeStatusReport` action dispatcher in `backend/gradient-ci/src/actions.rs`
 resolves the integration row and constructs a `GitlabReporter` (or the
-appropriate forge-specific reporter) per dispatch — the legacy per-project
+appropriate forge-specific reporter) per dispatch - the legacy per-project
 lookup helper has been removed.
 
-Unit tests (`cargo test -p core --tests ci::reporter`):
+Unit tests (`cargo test -p core --tests forge::reporter`):
 
 - `gitlab_state_from_ci_status_all_variants` - every `CiStatus` maps
   to the documented GitLab state (`pending`, `running`, `success`,
@@ -913,13 +1859,13 @@ Unit tests (`cargo test -p core --tests ci::reporter`):
 
 ## SSH private key decryption - no plaintext fallback
 
-`decrypt_ssh_private_key` in `backend/core/src/sources/ssh_key.rs`
+`decrypt_ssh_private_key` in `backend/gradient-sources/src/ssh_key.rs`
 decrypts the per-organization SSH key from `organization.private_key`.
 Decryption failure must NOT silently fall back to interpreting the
 stored value as a plaintext PEM, otherwise anyone with write access to
 that column could bypass encryption entirely.
 
-Tests (`backend/core/src/sources/ssh_key.rs`):
+Tests (`backend/gradient-sources/src/ssh_key.rs`):
 
 - `decrypt_ssh_key_corrupt_base64_fails` - non-base64 column rejected
   with `OrganizationKeyDecoding`.
@@ -991,7 +1937,7 @@ migration). Tests:
   anonymous access, private-org evaluations 404 for anonymous callers.
 - `backend/web/tests/old_direct_build_gone.rs` - see the regression
   block above.
-- `backend/core/src/storage/source_nar.rs` - in-file unit tests for
+- `backend/gradient-storage/src/source_nar.rs` - in-file unit tests for
   `materialise_source_nar`: deterministic NAR hash + store path across
   repeat calls, `-source` suffix on the resulting `/nix/store/<hash>`,
   and the canonical 32-char base32 hash shape.
@@ -1055,7 +2001,7 @@ single backlog could pin one DB connection indefinitely.
 The sweep is now `LIMIT`-bounded (`SIGN_SWEEP_BATCH = 1000` rows per
 pass) and batches the `cache` / `cached_path` lookups into one
 `is_in(...)` query each. Per-cache decrypted keys are wrapped in a new
-`CacheSigner` (in `backend/core/src/sources/cache_key.rs`) built once
+`CacheSigner` (in `backend/gradient-sources/src/cache_key.rs`) built once
 per pass per cache - the crypt secret is read at most once per cache,
 not once per signature. `sign_narinfo_fingerprint` is now a thin
 one-shot wrapper around `CacheSigner::sign_narinfo` so existing
@@ -1075,7 +2021,7 @@ Unit tests (`cargo test -p core --lib sources::cache_key`):
   decryption error per row.
 
 After issue #132, the dedicated `hex_hash_to_nix32` helper was removed
-and `sign_missing_signatures` calls `gradient_core::nix_hash::normalize_nar_hash`
+and `sign_missing_signatures` calls `gradient_util::nix_hash::normalize_nar_hash`
 directly. The hash-format conversion path is now covered by the
 algorithm-aware test suite in `cargo test -p core --lib nix_hash` (see
 above), which exercises both `sha256:` and `blake3:` inputs.
@@ -1135,7 +2081,7 @@ Tests (`cargo test -p worker --bins reconnect`):
 and `web_db`; nothing in the type system stopped a web handler from
 reaching for `state.db` (the proto/scheduler/cache pool) or vice versa.
 The `db` field is now `worker_db: WorkerDb` and `web_db: WebDb`
-(`backend/core/src/types/db.rs`). Both newtypes forward `ConnectionTrait`
+(`backend/gradient-db/src/pool.rs`). Both newtypes forward `ConnectionTrait`
 to the inner pool so existing call sites
 (`find().one(&state.web_db)`, `state.worker_db.execute(stmt)`, …) work
 unchanged. The compile-time defense kicks in at any function boundary
@@ -1212,7 +2158,7 @@ Eliminates the prior 18 ad-hoc `reqwest::Client::new()` /
 each created a fresh TCP/TLS connection pool with inconsistent (or
 absent) timeout and redirect policy.
 
-`backend/core/src/http.rs` builds the project-wide client with sane
+`backend/gradient-util/src/http.rs` builds the project-wide client with sane
 defaults (30 s timeout, `redirect::none`, and a branded
 `Gradient/<version> (+https://github.com/wavelens/gradient)`
 user-agent so upstream cache operators can attribute traffic). The
@@ -1225,7 +2171,7 @@ and the GitHub-App helpers (`get_installation_token`, `exchange_code`)
 now take the shared `reqwest::Client` as a parameter instead of building
 their own.
 
-Unit tests in `backend/core/src/http.rs`:
+Unit tests in `backend/gradient-util/src/http.rs`:
 
 - `build_client_succeeds` - the default builder yields a usable
   `reqwest::Client`.
@@ -1245,7 +2191,7 @@ Unit tests in `backend/core/src/http.rs`:
 
 ## Graceful shutdown (`#72`)
 
-`backend/core/src/shutdown.rs` introduces a `Shutdown` primitive bundling a
+`backend/gradient-util/src/shutdown.rs` introduces a `Shutdown` primitive bundling a
 `tokio_util::sync::CancellationToken` with a `tokio_util::task::TaskTracker`.
 It replaces bare `tokio::spawn` for every long-lived background task -
 dispatch loops, the outbound worker connection loop, the cache GC and
@@ -1256,7 +2202,7 @@ SIGINT/SIGTERM handler that calls `shutdown.cancel()`, hands the token to
 `shutdown.cancel_and_drain(30s)` so in-flight cleanups, metric writes, and
 webhook deliveries finish before the process exits.
 
-Unit tests in `backend/core/src/shutdown.rs`:
+Unit tests in `backend/gradient-util/src/shutdown.rs`:
 
 - `cancel_interrupts_select_loop` - a task that `select!`s on
   `cancelled()` against a 60-second sleep returns immediately when the
@@ -1270,7 +2216,7 @@ Unit tests in `backend/core/src/shutdown.rs`:
 
 ## Shared transitive-dependents walk (`#108`)
 
-`backend/core/src/db/dependency_graph.rs` exposes
+`backend/gradient-db/src/dependency_graph.rs` exposes
 `collect_transitive_dependents`, the single canonical reverse-edge BFS over
 the `derivation_dependency` table. Both the cache-invalidation closure
 revocation in `cache::cacher::invalidate::revoke_cache_derivation_closure`
@@ -1280,7 +2226,7 @@ through it instead of carrying their own copy. The cascade also collapses
 to a single batched `derivation IS IN (...)` builds query, replacing the
 prior per-iteration full re-scan + per-build edge probe.
 
-Unit tests in `backend/core/src/db/dependency_graph.rs`:
+Unit tests in `backend/gradient-db/src/dependency_graph.rs`:
 
 - `no_dependents_returns_only_start` - a leaf derivation yields a set
   containing exactly the starting id.
@@ -1335,7 +2281,7 @@ swaps. Unit tests (`cargo test -p entity --tests`) cover:
 - `serde` transparency (wire format identical to bare `Uuid`).
 - `FromStr` parsing (lets axum `Path<UserId>` extract from URL segments).
 - `TryFromU64` returns `DbErr` (UUID PKs are never `u64`-derivable).
-- `Default` resolves to `Uuid::nil()` so `Id::default() == Id::nil()` —
+- `Default` resolves to `Uuid::nil()` so `Id::default() == Id::nil()` -
   enables `Model { id, ..Default::default() }` ergonomics.
 
 ## Model defaults (`entity::model_default_tests`)
@@ -1345,12 +2291,12 @@ Every `DeriveEntityModel` struct derives `Default`, and every
 fail-noisy where applicable). Smoke tests in `backend/entity/src/lib.rs`
 confirm the derive resolves for representative models:
 
-- `user::Model::default()` — strings empty, `id` is nil, no password.
-- `build::Model::default()` — `status == BuildStatus::Created`.
-- `evaluation::Model::default()` — `status == EvaluationStatus::Queued`.
-- `audit_log::Model::default()` — JSON metadata is `None`, timestamp is
+- `user::Model::default()` - strings empty, `id` is nil, no password.
+- `build::Model::default()` - `status == BuildStatus::Created`.
+- `evaluation::Model::default()` - `status == EvaluationStatus::Queued`.
+- `audit_log::Model::default()` - JSON metadata is `None`, timestamp is
   the 1970 epoch from `NaiveDateTime::default()`.
-- `organization_cache::Model::default()` — `mode == ReadWrite`.
+- `organization_cache::Model::default()` - `mode == ReadWrite`.
 
 A nil ID is a placeholder, not a persistable value: callers override `id`
 (typically with `Id::now_v7()`) and use `..Default::default()` for the
@@ -1492,9 +2438,45 @@ returned by `GET /evals/{evaluation}` is locked in:
 
 Run with `cargo test -p scheduler --tests waiting_reason_tests`.
 
+The `graph_stuck` reason (pool can build everything but the dependency-closure
+gate leaves nothing dispatchable) round-trips in
+`backend/gradient-types/src/waiting_reason.rs::graph_stuck_round_trip`
+(`kind: "graph_stuck"`, `pending_anchors`). Its scheduler trigger -
+`build_phase_decision` detecting a `workers` verdict with empty `unmet`, running
+`requeue_failed_closure_for_eval` + `reconcile_closure_complete` + `promote_ready`,
+then re-assessing to `Building` or parking `graph_stuck` - is exercised end-to-end
+in CI (the db crate has no real-Postgres unit harness). The frontend renders it in
+`evaluation-log.component.spec.ts::titles and explains a graph-stuck stall`
+(`waitingTitle` "Recovering Build Graph", `formatWaitingReason` blocked count).
+
+`requeue_failed_closure_for_eval` is the load-bearing addition for the most common
+stuck case: a transitive dependency a *prior* eval left terminal-failed
+(`DependencyFailed`/etc.), which this eval pruned out so it carries no `build_job`
+here. `resolve_anchors` only requeues the eval's re-reported derivations
+(`all_drv_ids`), so such a dep stays failed, blocks its dependents
+(`etc`->`activate`->`nixos-system` observed live on `system-units`), and since the
+gate correctly refuses to dispatch it, nothing fails to trigger the reactive heal.
+The recursive-closure requeue walks `derivation_dependency` down from the eval's
+anchors and resets every `4/5/6/9` node to `Created`, so promotion (keyed on any
+`build_job`, not this eval's) rebuilds the failed subtree bottom-up.
+
+`reconcile_cached_anchors_for_eval` closes the underlying class: the dispatch gate
+keys on build-graph anchor state (`status` + `closure_complete`), which repeatedly
+desyncs from the durable cache state. A requeue / dependency-failed cascade / demote
+resets an anchor whose **outputs are all still in our cache** (`cached_path.file_hash`)
+to `Created`/`DependencyFailed`, so it satisfies neither gate arm and blocks its
+dependents though its artifacts exist (observed live: `tzdata-2026b` with all four
+outputs cached, anchor `status=0`/`closure_complete=f`, blocking the `etc` chain).
+Cache presence is the ground truth for "is this built", so the reconcile (over the
+eval's closure, in both the graph-stuck heal and `handle_eval_job_completed`) marks
+every fully-cached anchor `Completed` + `closure_complete`. The rare case where a
+cached output's runtime closure is itself incomplete is left to the reactive heals
+(`demote_referrers_of` / absent-orphan recovery) as the backstop. Exercised
+end-to-end in CI (the db crate has no real-Postgres unit harness).
+
 ## Pre-build evaluation stall when no worker exists (issue #97)
 
-`backend/core/src/state_machine/eval.rs::tests` extends the evaluation
+`backend/gradient-db/src/state_machine/eval.rs::tests` extends the evaluation
 state machine to allow the scheduler to surface a "no worker connected"
 stall before any builds have been queued:
 
@@ -1607,6 +2589,79 @@ demote rather than delete: `derivation_output.cached_path` is `ON DELETE
 SET NULL`, so a delete would silently drop the link plus the
 `cached_path_signature` placeholders, while a demote keeps the row's
 identity and lets a subsequent successful upload re-fill the metadata.
+
+## Worker aborts the running build, not just the upload (#309)
+
+Abort propagation reached the `compress`/`push` loop (above), but **not the
+derivation build itself**. `execute_build_job` only checked `abort` at the top
+of each task iteration; the long-running `build_derivation` never observed it.
+So cancelling a build server-side left the worker's nix-daemon compiling the
+derivation to completion - high memory, build still running, `LogChunk`s still
+streaming - while the server already showed no running build.
+
+Fix in `worker/src/executor/build.rs`: the build log drain races the daemon's
+log stream against the `abort` watch (`next_log_event`). When the server
+signals `AbortJob`, `drain_build_logs_with_timeout` returns
+`DrainOutcome::Aborted` and `realize` returns early *without* `mark_ok`.
+Dropping the `ScopedGuard` discards the daemon connection (closes the socket),
+which makes the nix-daemon kill the in-flight build. Because the build errors
+out before the compress/push stage, no NAR is uploaded for a cancelled build.
+
+Tests (`cargo test -p worker executor::build::tests`):
+
+- `next_log_event_returns_aborted_when_already_set` - abort already signalled
+  before the first poll yields `NextLog::Aborted` immediately, even against a
+  stalled stream.
+- `next_log_event_aborts_while_waiting_on_stalled_stream` - a stream that never
+  yields stays `Pending` until `abort` fires, then resolves to
+  `NextLog::Aborted` (proves a running build is interruptible, not hung).
+- `next_log_event_reports_stream_end` - an exhausted log stream maps to
+  `NextLog::StreamEnd` so a normal build still completes.
+- `next_log_event_errors_on_silent_timeout` - with `maxSilent` set and no log
+  output, the drain errors once the budget elapses (paused-time test).
+
+## Startup recovery preserves queued/waiting work
+
+`core/src/db/connection.rs::update_db` runs once on boot to reconcile work
+left behind by the previous process. It used to abort **everything** active -
+every `Created`/`Queued`/`Building` build and every `ACTIVE` evaluation - which
+needlessly threw away queued evaluations and builds that were only waiting for
+a free worker.
+
+The policy is now two pure predicates the recovery loop applies per row:
+
+- `eval_survives_restart` - `Queued` and `Waiting` evaluations survive (the
+  eval dispatcher re-offers `Queued`; build reconcile re-drives `Waiting`).
+  `Fetching` / `EvaluatingFlake` / `EvaluatingDerivation` / `Building` were
+  running on a now-disconnected worker, so they are aborted (and their project
+  is flagged `force_evaluation`).
+- `build_survives_restart` - a build survives only if it is `Created`/`Queued`
+  **and** its evaluation survives. A `Building` build was mid-compile on a lost
+  worker; a queued build under an aborted evaluation goes with it.
+
+Tests (`cargo test -p core startup_recovery_tests`):
+
+- `queued_and_waiting_evaluations_survive_restart`
+- `actively_running_evaluations_are_aborted_on_restart`
+- `queued_builds_of_a_surviving_evaluation_survive_restart` - the "eval waiting
+  case" from the bug report: builds queued for a free worker are kept.
+- `running_builds_are_aborted_even_under_a_surviving_evaluation`
+- `builds_of_an_aborted_evaluation_are_aborted`
+
+## Server startup: recover interrupted work (`gradient-db`)
+
+`gradient_db::recover_interrupted_work` (`backend/gradient-db/src/recovery.rs`) runs at
+`serve_web` startup to reconcile work left in-flight by the previous process: aborts
+`Running` `build_attempt` rows, re-queues `Building` builds, aborts `Fetching` /
+`EvaluatingFlake` / `EvaluatingDerivation` evaluations, and sets `force_evaluation` on
+their projects. `Building` evaluations and all terminal states are not touched.
+
+Unit tests in `backend/gradient-db/src/recovery.rs` (MockDatabase):
+
+- `all_four_operations_populate_report` - feeds mock `rows_affected` for each step and
+  asserts the `RecoveryReport` fields match.
+- `project_force_step_skipped_when_no_pre_build_evals` - empty eval SELECT causes steps
+  3b/3c to be skipped; report fields all zero.
 
 ## Cache GC - guard shared-hash NARs and purge zombie cached_path rows
 
@@ -1737,6 +2792,39 @@ Tests (`cargo test -p scheduler --tests substitut`):
   eval completes without dispatching a build. Confirms the hash-based
   fallback in `compute_truly_substituted`.
 
+## Substituted at build time - outputs already valid on the worker (#303, #399)
+
+When the daemon reports a build's outputs as already valid (empty
+`built_outputs`), no build actually ran. The worker sets the `substituted`
+flag on its `BuildOutput` job update. `handle_build_output` records that flag
+on `build.substituted` but leaves the build in `Building`: it must not become
+terminal here, because the worker pushes the output NARs only at the end of
+the job (just before `JobCompleted`). Flipping to `Substituted` on
+`BuildOutput` made the build dispatch-ready while its bytes were still absent
+from the cache, so a dependent dispatched into that window (the incremental
+mid-eval dispatcher, #392/#399) failed `InputsUnavailable`.
+`handle_build_job_completed` reads the flag and finalises the terminal status
+(`Substituted` vs `Completed`) after the push. This is distinct from eval-time
+`compute_truly_substituted` (above), which covers outputs already cached
+before evaluation.
+
+Tests:
+
+- `terminal_status_is_substituted_only_when_outputs_were_already_valid`
+  (`scheduler`) - `terminal_success_status(true)` is `Substituted`,
+  `(false)` is `Completed`; the single source of truth for the completion
+  status, decided from the persisted flag.
+- `build_sm_building_to_substituted` (`core`) - the `Building → Substituted`
+  transition is permitted by the state machine.
+- `build_output_substituted_records_flag_without_terminal_transition`
+  (`scheduler`) - `handle_build_output` with `substituted = true` writes
+  `build.substituted` and leaves the build in `Building`; it does not run the
+  terminal status transition.
+- `build_completed_finalizes_substituted_from_flag` (`scheduler`) - a
+  `Building` build whose `substituted` flag is set finalises as `Substituted`
+  on `JobCompleted` (an actual `Building → Substituted` UPDATE), and the
+  evaluation finalises as `Completed`.
+
 ## Scheduler policy - anti-starvation cap (#112)
 
 `WaitTimeRule::max_wait_secs` caps how much wait time can contribute to a
@@ -1745,20 +2833,50 @@ job's score. The previous default (600s, +60 max) was below
 fully-cached candidates outscored older queued builds indefinitely -
 builds older than 10 minutes were no longer differentiated by wait time.
 The default is now 3600s (+360 max), enough to overcome the cached-fresh
-preference plus typical penalties on the older job.
+preference plus typical penalties on the older job. The scoring rules and
+the composed default policy now live in the `score` crate.
 
-Tests (`cargo test -p scheduler --lib policy`):
+Tests (`cargo test -p score policy`):
 
-- `default_policy_long_waiting_build_overcomes_fresh_cached` - locks in
-  the anti-starvation guarantee by composing the full
-  `Policy::default_build_policy()`: a build queued an hour ago must
-  outscore a fresh candidate the worker can serve directly. Fails if
-  `WaitTimeRule::max_wait_secs` is lowered back below the
-  `MissingPathsRule` scored bonus.
-- `wait_time_rule_longer_wait_scores_higher_but_capped` - preserved from
-  before; still asserts that the score saturates at
-  `max_wait_secs * bonus_per_second` so ancient jobs cannot dominate
+- `simple_policy_long_waiting_build_overcomes_fresh_cached` -
+  (`score::policy`) locks in the anti-starvation guarantee by composing
+  the full simple policy via `policy_by_name("simple")`: a build queued
+  an hour ago must outscore a fresh candidate the worker can serve
+  directly. Fails if `WaitTimeRule::max_wait_secs` is lowered back below
+  the `MissingPathsRule` scored bonus.
+- `simple_policy_prefers_ready_over_costly` - (`score::policy`) a ready
+  job (0 missing paths, 0 NAR, real arch) must outscore a builtin job
+  with 5 missing paths and a 50MB NAR.
+- `wait_time_longer_wait_scores_higher_but_capped` -
+  (`score::rules::builtin`) per-rule guard: asserts the score saturates
+  at `max_wait_secs * bonus_per_second` so ancient jobs cannot dominate
   every other rule.
+
+## Scheduler policy - per-org fair share (#111)
+
+A tenant flooding the queue with hundreds of builds previously starved a
+quiet tenant: `WaitTimeRule` plateaus at +360, so once the busy org's jobs
+maxed out their wait bonus there was nothing left to favour the quiet org.
+`FairShareRule` penalizes a candidate proportional to its owning org's
+share of currently-active builds (`org_share`, computed in-memory by the
+scheduler in `take_best_of_kind` from the active-job map and threaded into
+`JobContext`). The default weight (500) exceeds the wait plateau (360) so
+fairness overrides the wait gradient. The rule is part of the
+`resource-aware` policy; `org_share` is `None` (no penalty) when no builds
+are active.
+
+Tests (`cargo test -p score fair_share`, `cargo test -p scheduler fair_share`):
+
+- `busier_org_scores_more_negative` - (`score::rules::fair_share`) a job
+  with `org_share = Some(0.99)` scores more negative than `Some(0.01)`.
+- `zero_share_and_none_score_zero` - (`score::rules::fair_share`)
+  `Some(0.0)` and `None` both contribute exactly 0.
+- `fair_share_overrides_wait_gradient` - (`score::rules::fair_share`) a
+  quiet org (share 0) outscores a busy org (share 1) even when the busy
+  job has saturated `WaitTimeRule`, proving the weight beats the plateau.
+- `fair_share_quiet_org_wins_over_busy_org` - (`scheduler::jobs`) end to
+  end: org A already has five active builds, org B none; with the
+  `resource-aware` policy the next build is assigned to B's pending job.
 
 ## Build artefacts - `external_cached` outputs include `hydra-build-products`
 
@@ -1933,7 +3051,7 @@ context entirely. `create_router` (`backend/web/src/lib.rs`) now wires
 `TraceLayer::make_span_with` (which opens an `http_request` span
 carrying `method`, the `MatchedPath` route, and the `x-request-id`),
 and `PropagateRequestIdLayer` (which echoes the id on the response).
-`Shutdown::spawn` (`backend/core/src/shutdown.rs`) wraps every spawned
+`Shutdown::spawn` (`backend/gradient-util/src/shutdown.rs`) wraps every spawned
 future with `.in_current_span()`, so cleanup tasks inherit the request
 span and the id is on every line they emit.
 
@@ -2035,45 +3153,6 @@ The metric encoder itself is exercised by a unit test
 (`web::endpoints::metrics::tests::render_emits_expected_metric_names_and_help`)
 that drives `render` with a fixed `Observations` struct and asserts the
 resulting `# HELP` / `# TYPE` lines and value formatting.
-
-## GitHub App as a server-managed integration row
-
-Coverage of the explicit `outbound_integration` opt-in for GitHub status
-reporting and the protections around the auto-managed `forge_type=github`
-integration rows. Run with
-`cargo test -p web --test projects_integration` and
-`cargo test -p core --tests ensure_tests`.
-
-`backend/web/tests/projects_integration.rs`:
-
-- `put_project_integration_accepts_github_outbound_row` - linking a project
-  to the auto-managed GitHub outbound integration via its UUID succeeds.
-- `put_project_integration_accepts_non_github_outbound_row` - Gitea/GitLab
-  outbound rows continue to work the same way (regression).
-- `patch_integration_rejects_github_row` /
-  `delete_integration_rejects_github_row` - server-managed rows can't be
-  edited or deleted via the org integrations API.
-- `delete_integration_accepts_non_github_row` - non-managed rows still
-  delete normally (regression).
-- `put_integration_still_rejects_github_forge_type` - POST with
-  `forge_type=github` continues to be rejected (no manual rows).
-- `put_integration_rejects_reserved_github_name` - name `"github"` is
-  reserved for the auto-managed row; user-created integrations using it
-  are rejected with 400.
-
-`backend/core/src/ci/integration_lookup.rs::ensure_tests`:
-
-- `creates_both_rows_when_none_exist` - calling
-  `ensure_github_app_integrations` on an org with no existing rows inserts
-  the inbound and outbound GitHub rows.
-- `skips_kinds_that_already_exist` - repeated calls are idempotent; rows
-  that already exist for that org/kind are not duplicated.
-
-The resolver simplification (URL-based auto-detection removed) is
-indirectly covered by the `put_project_integration_accepts_*` tests:
-linking returns the row id and the resolver now branches purely on
-`project_integration.outbound_integration` plus the integration's
-`forge_type`.
 
 ## Worker: empty `built_outputs` self-heals from the parsed `.drv`
 
@@ -2326,7 +3405,7 @@ Three cases:
 
 ## Sentry DSN - operator-overridable reporting target (issue #106)
 
-Tests in `backend/core/src/types/cli/registration.rs` cover the DSN override helper:
+Tests in `backend/gradient-types/src/cli/registration.rs` cover the DSN override helper:
 
 - `effective_sentry_dsn_returns_default_when_none` - when `RegistrationArgs::sentry_dsn` is `None`, the helper returns `DEFAULT_SENTRY_DSN` (the upstream Wavelens DSN).
 - `effective_sentry_dsn_returns_override_when_some` - when an operator sets `GRADIENT_SENTRY_DSN` / `settings.sentryDsn`, the helper returns the override string, and the three Sentry init call-sites (`backend/src/main.rs`, `cache_loop`, `sign_sweep_loop`) route reports there instead.
@@ -2508,7 +3587,7 @@ the paginated type, which made the CLI mis-report a 200 as `api error (200)`.
 guards the rustls trust setup: `Client::builder().build()` must succeed
 regardless of whether the platform CA store is reachable. The CLI loads
 system certs via `rustls-native-certs` (so self-hosted instances with a
-self-signed CA installed in the OS trust store work — fix for #287) and
+self-signed CA installed in the OS trust store work - fix for #287) and
 falls back to the bundled Mozilla CA bundle via `webpki-roots` when no
 system store is present (Nix sandbox, minimal containers). Native cert
 loading degrades silently when `/etc/ssl/certs` is missing.
@@ -2516,6 +3595,7 @@ loading degrades silently when `/etc/ssl/certs` is missing.
 CLI integration tests in `cli/tests/`:
 
 - `download_attr.rs` - `gradient download '#attr' --json` writes the right files; `--json` without args returns a structured missing-argument envelope and exits 2.
+- `build_watch.rs` (#314) - `gradient build --help` exposes `-b`/`--background` and no longer advertises the removed `--no-stream`; `gradient watch --help` documents the required `<EVALUATION>` argument; `gradient watch` with no argument exits non-zero.
 - `completion.rs` - regression for the broken completion bin name: `gradient completion {bash,zsh}` must emit a script that registers against the real `gradient` binary (`-F _clap_complete_gradient gradient`) and never the capitalised `Gradient` app name, which silently disabled `gradient <TAB>`. Also asserts the zsh script appends the autoload bridge (`[[ ${funcstack[1]} = _gradient ]] && _clap_dynamic_completer_gradient "$@"`) so the fpath autoload file the Nix package installs completes on the first TAB instead of only after a second.
 
 Dynamic completer unit tests live in `cli/src/commands/completion.rs` (`#[cfg(test)]`,
@@ -2564,7 +3644,7 @@ immediately. Coverage:
   the eval-capable count is zero, even if total connected workers
   are non-zero (the runtime caller passes the eval-capable count,
   not the total).
-- `web/src/endpoints/forge_hooks/events.rs` - extraction of
+- `core/src/forge/webhook.rs` - extraction of
   `pr_number`, `pr_author`, `is_fork`, `base_owner`, `base_repo` from
   GitHub / Gitea / GitLab payloads.
 - `web/src/endpoints/forge_hooks/trigger.rs::parse_gradient_*` -
@@ -2591,11 +3671,11 @@ immediately. Coverage:
   wildcard into the same row update that flips `Waiting -> Queued`,
   so the dispatcher reads a consistent row; same guards as
   `unpark_approval`.
-- `core/src/ci/reporter.rs::{gitea,github,gitlab}_comment_url_*`
+- `core/src/forge/reporter.rs::{gitea,github,gitlab}_comment_url_*`
   (issue #274) - per-forge URL builders for the `post_pr_comment`
   trait method that surfaces wildcard parse errors back to the
   commenter.
-- `core/src/ci/reporter.rs::forge_comment_payload_serializes_with_body_field`
+- `core/src/forge/reporter.rs::forge_comment_payload_serializes_with_body_field`
   (issue #274) - the shared `{"body": "..."}` JSON payload sent to
   all three forges.
 - `core/src/ci/unpark.rs::unpark_approval_*` - transitions
@@ -2645,7 +3725,7 @@ immediately. Coverage:
 
 ## Actions (per-project)
 
-### Backend — REST endpoints (`backend/web/tests/actions.rs`)
+### Backend - REST endpoints (`backend/web/tests/actions.rs`)
 
 Run with: `cargo test -p web --test actions`
 
@@ -2664,7 +3744,7 @@ Run with: `cargo test -p web --test actions`
 - `view_role_cannot_delete_action` - `403` for callers without write permission.
 - `managed_project_rejects_create` - state-managed projects reject action mutations with `403`.
 
-### Backend — dispatcher unit tests (`backend/core/tests/actions_dispatch.rs`)
+### Backend - dispatcher unit tests (`backend/core/tests/actions_dispatch.rs`)
 
 Run with: `cargo test -p core --test actions_dispatch`
 
@@ -2674,7 +3754,7 @@ Run with: `cargo test -p core --test actions_dispatch`
 - `forge_status_ignores_events_list` - `forge_status_report` always maps `build.started/completed/failed` regardless of `events`.
 - `payload_helpers_include_all_fields` - outgoing JSON payload for `send_web_request` contains `event`, `project`, `organization`, `id`, `status`.
 
-### Backend — inline unit tests (`backend/core/src/ci/actions.rs`)
+### Backend - inline unit tests (`backend/gradient-ci/src/actions.rs`)
 
 Run with: `cargo test -p core --lib ci::actions::tests`
 
@@ -2694,17 +3774,17 @@ Run with: `pnpm --dir frontend exec ng test --watch=false`
 
 ## Cache roles & permissions (issue #265)
 
-- `backend/core/src/permissions.rs` — `CachePermission` bitmask unit tests
-- `backend/web/src/access.rs` — `load_cache` access matrix tests
-- `backend/web/tests/cache_roles.rs` — role CRUD endpoint tests
-- `backend/web/tests/cache_members.rs` — member CRUD endpoint tests
-- `backend/web/tests/cache_subscription_gate.rs` — bilateral subscription tests
-- `backend/web/tests/cache_api_key_pinning.rs` — cache-pinned API key tests
+- `backend/gradient-db/src/permissions.rs` - `CachePermission` bitmask unit tests
+- `backend/web/src/access.rs` - `load_cache` access matrix tests
+- `backend/web/tests/cache_roles.rs` - role CRUD endpoint tests
+- `backend/web/tests/cache_members.rs` - member CRUD endpoint tests
+- `backend/web/tests/cache_subscription_gate.rs` - bilateral subscription tests
+- `backend/web/tests/cache_api_key_pinning.rs` - cache-pinned API key tests
 
 ## Admin tasks & deep GC (issue #271)
 
-- `backend/core/src/db/admin_tasks.rs` — DB helper unit tests: insert/find/mark transitions, unique-violation detection, startup recovery `mark_all_active_failed`.
-- `backend/cache/src/cacher/deep_gc.rs` — sweep unit tests: blob pass removes orphan blob, blob pass purges zombie row, log pass removes orphan log, `DeepGcReport` serialises with snake_case keys.
+- `backend/gradient-db/src/admin_tasks.rs` - DB helper unit tests: insert/find/mark transitions, unique-violation detection, startup recovery `mark_all_active_failed`.
+- `backend/cache/src/cacher/deep_gc.rs` - sweep unit tests: blob pass removes orphan blob, blob pass purges zombie row, log pass removes orphan log, `DeepGcReport` serialises with snake_case keys.
 
 ## Evaluation start - surface repository errors (issue #280)
 
@@ -2720,7 +3800,7 @@ banner under the project header instead of failing silently.
 
 Run with: `cargo test -p core --test git_remote`
 
-- `check_project_updates_propagates_unreachable_remote_error` — `git://127.0.0.1:1/…`
+- `check_project_updates_propagates_unreachable_remote_error` - `git://127.0.0.1:1/…`
   triggers an immediate connection-refused; the helper now returns `Err(SourceError)`
   instead of `Ok((false, vec![]))`. Locks in the propagation guarantee that the
   endpoint relies on for its 4xx mapping.
@@ -2730,39 +3810,93 @@ Run with: `cargo test -p core --test git_remote`
 Run with: `pnpm --dir frontend exec ng test --watch=false`
 
 - `project-detail.component.spec.ts → 'shows an inline error banner when
-  startEvaluation fails'` — mocks `ProjectsService.startEvaluation` to throw;
+  startEvaluation fails'` - mocks `ProjectsService.startEvaluation` to throw;
   asserts the `.evaluation-error` banner renders the underlying message.
 - `project-detail.component.spec.ts → 'clears the error banner when the user
-  retries'` — calling `dismissError()` resets `errorMessage()` to `null` and the
+  retries'` - calling `dismissError()` resets `errorMessage()` to `null` and the
   banner disappears.
+
+## Flake `git+` scheme breaks repository polling (#427)
+
+A repository URL stored in its nix flake form (`git+https://host/org/repo.git`)
+passes validation but failed evaluation with `Git command failed: invalid
+argument port`. libgit2 registers no `git+https`/`git+http` transport, so it
+misroutes such URLs to SSH, whose scheme has no default port, and the connect
+aborts. The libgit2 polling paths (`ls_remote_head`, `commit_info`) now strip the
+`git+` prefix via `git::url::git_transport_url` before handing the URL to
+libgit2, mirroring what `parse_nix_git_url` already does for the SSH prefetch
+path. Bare schemes and SCP-style remotes pass through unchanged.
+
+Run with: `cargo test -p gradient-sources --lib git::tests::git_transport_url`
+
+- `git_transport_url_strips_git_plus_https` - `git+https://…/repo..git` →
+  `https://…/repo..git` (the exact URL from the issue).
+- `git_transport_url_strips_git_plus_http_and_ssh` - `git+http://` and
+  `git+ssh://` lose the prefix too.
+- `git_transport_url_passes_through_bare_schemes_and_scp` - `https://`, `git://`,
+  and `git@host:path` are returned verbatim.
+
+## Gitea test webhook rejected as malformed (#428)
+
+Gitea's "Test Delivery" button sends a push event with an all-zero `after` SHA
+(the same shape a real branch/tag deletion has). `decode_push_commit` returns
+`None` for that, and the endpoint conflated it with a genuinely unparseable
+payload, answering `400 malformed webhook payload` - which makes the forge mark
+the webhook as failing. Push parsing now returns a `PushOutcome`: `None` only for
+unparseable JSON (still `400`), `Ignored` for a well-formed but non-buildable
+delivery (all-zero SHA), and `Build` for a real push. The endpoint maps `Ignored`
+to a `200` empty `WebhookResponse` (`event: "push"`, no queued/skipped).
+
+### gradient-forge
+
+Run with: `cargo test -p gradient-forge --lib webhook`
+
+- `gitea_test_webhook_zero_sha_is_ignored_not_malformed` - the exact issue
+  payload parses to `Some(PushOutcome::Ignored)`, not `None`.
+- `github_branch_deletion_zero_sha_is_ignored` - a real branch deletion is also
+  a no-op, not an error.
+- `push_with_unparseable_json_is_malformed` - non-JSON and `{}` still yield
+  `None` (the `400` path).
+- `github_push_extracts_commit_subject_and_author`,
+  `github_push_without_head_commit_has_no_message`,
+  `gitlab_push_picks_commit_matching_after` - real pushes still parse to
+  `PushOutcome::Build` (updated for the new return type).
+
+### gradient-web
+
+Run with: `cargo test -p gradient-web --test forge_hooks`
+
+- `forge_webhook_test_ping_zero_sha_is_ok_noop` - posting the all-zero Gitea
+  push to `/hooks/gitea/{org}/{name}` (valid signature) returns `200` with an
+  empty `push` response and touches no trigger/project rows.
 
 ## Source-IP allowlist (#282)
 
 ### Backend
 
-Run with: `cargo test -p core --test ip_allowlist`
+Run with: `cargo test -p gradient-web --test ip_allowlist`
 
-- `empty_list_allows_everything` — empty allowlist is a permissive default so
+- `empty_list_allows_everything` - empty allowlist is a permissive default so
   existing rows keep working after migration.
-- `slash_32_exact_match`, `slash_24_contains_address` — exact-host and net-mask
+- `slash_32_exact_match`, `slash_24_contains_address` - exact-host and net-mask
   containment.
-- `ipv4_mapped_ipv6_matches_ipv4_cidr` — dual-stack sockets compare correctly.
-- `malformed_entry_is_skipped_but_others_still_count` — validation happens at
+- `ipv4_mapped_ipv6_matches_ipv4_cidr` - dual-stack sockets compare correctly.
+- `malformed_entry_is_skipped_but_others_still_count` - validation happens at
   the API edge; the runtime check tolerates noise.
 - `normalize_bare_ipv4_to_slash_32` / `normalize_bare_ipv6_to_slash_128` /
   `normalize_keeps_cidr_unchanged` / `normalize_trims_whitespace` /
-  `normalize_rejects_garbage` / `normalize_rejects_empty` — write-time canonicalization.
+  `normalize_rejects_garbage` / `normalize_rejects_empty` - write-time canonicalization.
 
 ## Upstream cache types + Gradient Proto (#118)
 
-- `cargo test -p entity --lib cache_upstream` — `as_source` for internal/gradient_proto/http + inconsistent rows.
-- `cargo test -p core --lib db::cache_upstream` — http vs gradient_proto upstream resolution.
-- `cargo test -p core --lib sources::secret` — encrypt/decrypt roundtrip for stored credentials.
-- `cargo test -p web --lib endpoints::caches::upstreams` — per-type validation error messages, plus `validate_gradient_proto_requires_https_when_api_key_present` (an API key forces an `https://` upstream) and `validate_gradient_proto_rejects_unsafe_remote_cache` (remote cache name restricted to a safe charset).
-- `cargo test -p proto --lib handler::cache` — cache-scoped query + Push rejection.
-- `cargo test -p proto --lib handler::cache_session` — read-only message allow-list.
-- `cargo test -p proto --lib handler::limiter` — per-IP connection cap.
-- `cargo test -p proto --lib handler::cache_consumer` — ws URL building.
+- `cargo test -p entity --lib cache_upstream` - `as_source` for internal/gradient_proto/http + inconsistent rows.
+- `cargo test -p core --lib db::cache_upstream` - http vs gradient_proto upstream resolution.
+- `cargo test -p core --lib sources::secret` - encrypt/decrypt roundtrip for stored credentials.
+- `cargo test -p web --lib endpoints::caches::upstreams` - per-type validation error messages, plus `validate_gradient_proto_requires_https_when_api_key_present` (an API key forces an `https://` upstream) and `validate_gradient_proto_rejects_unsafe_remote_cache` (remote cache name restricted to a safe charset).
+- `cargo test -p proto --lib handler::cache` - cache-scoped query + Push rejection.
+- `cargo test -p proto --lib handler::cache_session` - read-only message allow-list.
+- `cargo test -p proto --lib handler::limiter` - per-IP connection cap.
+- `cargo test -p proto --lib handler::cache_consumer` - ws URL building.
 
 ## Fetch-capability gating for flake jobs (#252)
 
@@ -2775,9 +3909,9 @@ jobs on the worker's `fetch` capability.
 
 Run with: `cargo test -p scheduler --lib jobs`
 
-- `fetch_flake_job_requires_fetch_capability` — a `FetchFlake` flake job is not
+- `fetch_flake_job_requires_fetch_capability` - a `FetchFlake` flake job is not
   assigned to a worker lacking `fetch`, but is assigned to a fetch-capable one.
-- `cached_eval_job_runs_without_fetch_capability` — an eval-only follow-up job
+- `cached_eval_job_runs_without_fetch_capability` - an eval-only follow-up job
   (cached source, no `FetchFlake`) still runs on a worker without `fetch`.
 
 ## Adaptive fetch/eval split
@@ -2790,15 +3924,1186 @@ worker substitutes the cached source from the binary cache before evaluating.
 Run with: `cargo test -p scheduler --lib` and `cargo test -p worker --lib`
 
 - `worker_pool::tests::idle_eval_only_worker_detected` /
-  `draining_eval_only_worker_does_not_count` — the split heuristic (an idle,
+  `draining_eval_only_worker_does_not_count` - the split heuristic (an idle,
   non-draining eval-only worker triggers the split).
-- `jobs::tests::is_fetch_only_true_only_for_fetch_task_alone` — recognises a
+- `jobs::tests::is_fetch_only_true_only_for_fetch_task_alone` - recognises a
   fetch-only job by its task list.
-- `jobs::tests::cached_followup_rewrites_source_and_tasks` — builds the cached
+- `jobs::tests::cached_followup_rewrites_source_and_tasks` - builds the cached
   eval follow-up (Cached source, eval tasks, source as a required path).
-- `scheduler_tests::fetch_only_completion_enqueues_cached_eval_followup` — a
+- `scheduler_tests::fetch_only_completion_enqueues_cached_eval_followup` - a
   completed fetch-only job enqueues the cached eval follow-up reusing its id.
-- `policy::tests::reserve_rule_penalizes_fetch_worker_for_cached_eval_only` —
+- `policy::tests::reserve_rule_penalizes_fetch_worker_for_cached_eval_only` -
   fetch workers are penalised for cached-eval jobs, eval-only workers are not.
-- `executor::eval::tests::cached_source_requires_store_path_present` — the
+- `executor::eval::tests::cached_source_requires_store_path_present` - the
   worker substitutes the cached source before eval.
+
+## Forge integration - maintainer approval bypass & wildcard check name (#298)
+
+A fork-PR approval gate must not re-park runs initiated by a maintainer, and a
+command-driven run with a custom wildcard must report under its own check line.
+
+The gate decision is split from its forge probe: `decide_pr_gate` resolves
+whether the event's actor is a trusted repo writer (via `sender_is_trusted`),
+then delegates the branching to the pure `gate_decision`. A `/gradient run`
+that creates a fresh evaluation, and a maintainer force-push onto a
+contributor's branch (`synchronize`), both thread the event `sender` so the
+gate is bypassed once the actor is verified.
+
+The Evaluation check name gains a wildcard suffix
+(`gradient/{project}: Evaluation: {wildcard}`) whenever the evaluation's
+wildcard differs from the project default.
+
+Run with: `cargo test -p web --lib forge_hooks` and
+`cargo test -p core --tests ci::reporting`.
+
+- `trigger::tests::gate_same_repo_pr_bypasses` - same-repo PR runs without a gate.
+- `trigger::tests::gate_fork_untrusted_sender_parks` - fork PR with an
+  untrusted sender parks for approval (carrying PR number/author).
+- `trigger::tests::gate_fork_trusted_sender_bypasses` - a trusted maintainer
+  (force-push / command) bypasses the gate.
+- `trigger::tests::gate_unknown_fork_status_fails_closed` - uncertain fork
+  status with an untrusted sender parks (fail-closed).
+- `events::tests::github_pr_sender_distinct_from_author_on_force_push` /
+  `gitea_pr_parses_sender_login` / `gitlab_mr_sender_falls_back_to_event_user`
+  - the event actor is parsed independently of the PR author.
+- `reporting::tests::evaluation_context_format_with_custom_wildcard` - custom
+  wildcard produces `gradient/{project}: Evaluation: {wildcard}`.
+
+## Evaluation check goes green when the eval finishes, not all builds (#453)
+
+The forge Evaluation check used to flip green only on `evaluation.completed`,
+which fires after every build finishes. It now succeeds at `evaluation.building`
+(the moment the eval phase concludes and builds start); per-build checks carry
+build outcomes. Once `evaluation.building_started_at` is set, a later
+Failure/Error on the Evaluation context is suppressed so a build failure or a
+user abort cannot redden the already-green eval check.
+
+Run with: `cargo test -p gradient-ci --lib` and
+`cargo test -p gradient-core --test actions_dispatch`.
+
+- `reporting::tests::suppresses_eval_failure_only_after_building` -
+  `suppress_evaluation_failure` returns true for Failure/Error only when
+  `reached_building`, and never for Success/Pending.
+- `actions::tests::forge_status_mapping` /
+  `actions_dispatch::forge_status_mapping_complete` -
+  `evaluation.building → Success`.
+- `actions::tests::matches_event_forge_status_ignores_stored_events` -
+  `forge_status_report` actions also match the `evaluation.building` event.
+
+## GitHub installations declared as `github` integrations (#453)
+
+State-managed GitHub installations live in the `integrations` map as
+`forge_type=github` entries carrying an `installation_id` (no secret/token), not
+a separate top-level resource or an org-state list. Apply upserts the
+`github_installation` row and links it from the integration; export round-trips
+the `installation_id`/`account_login`; validation requires a positive
+`installation_id` for github entries.
+
+Run with: `cargo test -p gradient-state`.
+
+- `config::config_tests::deserializes_github_integration_with_installation_id` -
+  a `forge_type=github` integration deserialises with `installation_id` +
+  optional `account_login`.
+- `tests::state_github_integration_requires_installation_id` - a github
+  integration with no `installation_id` fails validation on
+  `integrations.{name}.installation_id`.
+- `tests::state_github_integration_with_installation_id_is_valid` - the same
+  entry with a positive `installation_id` validates.
+
+## Cache upload - NAR ingest, endpoint, connector, and CLI (issue #261)
+
+### Shared NAR ingest (`gradient_proto::ingest`)
+
+Run with: `cargo test -p gradient-proto ingest`
+
+- `malformed_store_path_bails_before_any_io` - a syntactically invalid store
+  path is rejected before any blob write is attempted.
+- `create_path_writes_blob_and_reports_created` - a valid NAR + narinfo pair
+  writes the blob to storage and returns `IngestResult::Created`.
+
+### Upload endpoint (`web` crate)
+
+Run with: `cargo test -p web --test caches_upload`
+
+- `upload_unauthenticated_returns_403` - `POST /api/v1/caches/{cache}/nars`
+  without a bearer token returns `403`.
+- Real-DB integration stubs are present but marked `#[ignore]`; they run in
+  CI against a live Postgres instance.
+
+### Connector multipart upload (`connector` crate)
+
+Run with: `cargo test -p connector nar_upload`
+
+- `nar_upload_posts_multipart` - the connector assembles the correct multipart
+  form (a `narinfo` JSON part and a `nar` binary part) and maps a 200 response
+  to success.
+
+### CLI narinfo parser
+
+Run with: `cargo test -p gradient-cli`
+
+- `parses_full_narinfo` - a complete `.narinfo` file round-trips through the
+  parser with all fields populated.
+- `missing_required_field_errors` - a narinfo missing a required field (e.g.
+  `StorePath`) returns a parse error naming the field.
+- `empty_references_ok` - a `References:` line with no paths is accepted and
+  produces an empty references list.
+
+### CLI `cache_upload` integration
+
+Run with: `cargo test -p gradient-cli`
+
+- `upload_nar_file_with_narinfo_succeeds` - providing both `--nar-file` and
+  `--narinfo` drives the chunked upload (`PUT .../nars/{hash}/chunk` then
+  `POST .../nars/{hash}/finalize`) against a mock server and returns success.
+- `upload_nar_file_without_narinfo_errors` - omitting `--narinfo` in no-nix
+  mode exits with a usage error (exit code 2).
+
+### CLI TUI view-model tests
+
+Run with: `cargo test -p gradient-cli`
+
+- `tui::nar_browser` - filter input narrows the displayed list; scroll position
+  resets to 0 when the filter changes; clearing the filter restores the full
+  list.
+- `tui::graph` - expanding a collapsed node adds its children to the visible
+  set; collapsing removes them; nested expand/collapse is consistent; `Esc`
+  triggers quit.
+- `tui::log_view` - `↑`/`↓` scroll adjusts the offset; enabling follow-tail
+  pins the view to the last line; `/` search highlights matching lines.
+- `tui::watch` (#314) - the `gradient watch` dashboard view-model:
+  `BuildSummary::of` classifies build statuses into succeeded/failed/building/
+  queued counts; `eval_is_terminal` recognises `Completed`/`Failed`/`Aborted`;
+  `format_duration`/`format_build_time` render elapsed and per-build times;
+  streamed log chunks split on newlines and buffer partial lines; evaluation
+  messages are de-duplicated by id; follow-tail pins to the bottom until an
+  `↑` scroll detaches it.
+
+## REST API endpoint surface (NixOS integration)
+
+`nix/tests/gradient/api` boots a single node (gradient + nginx + postgres, no
+worker or nix store) and drives `nix/tests/gradient/api/test.py`. Every
+management endpoint is hit directly (`curl`) and, where the CLI exposes it, also
+through `gradient`. Resources are created at runtime so the creation endpoints
+are covered too. Phases:
+
+- **Auth / user / keys** - check-username, register, login, logout; profile,
+  settings, sessions, audit-log, search; API-key create/list/revoke/delete.
+- **Organizations** - CRUD, available/public, ssh rotation, roles CRUD, and
+  membership (a second user is added via `POST /orgs/{org}/users`, re-roled with
+  `PATCH`, and removed with `DELETE`, asserting the member list each time).
+- **Projects** - CRUD, details, triggers, active toggle, plus a transfer flow
+  that moves a throwaway project to a second org and verifies it disappears from
+  the source and appears under the destination.
+- **Workers** - register/list/patch/delete (direct + CLI), with v4 worker UUIDs.
+- **Caches** - CRUD, key/stats, active/public toggles, plus sub-resources:
+  member add/re-role/remove, custom-role create/get/patch/delete, an HTTP
+  upstream create/patch/delete, and org subscription remove/restore.
+- **Cache NARs** - synthetic upload (CLI + direct multipart), list/show/stats/
+  available, and delete (CLI plus a direct `DELETE` asserting `204`).
+- **Build-dependent endpoints** - exercised on empty state for correct
+  not-found behaviour, since no builds are present.
+- **Edge cases** - duplicate creates (org, project, cache, org/cache role, API
+  key, org/cache member, subscription) return an enveloped `409`; a reserved
+  project name (`build-request`) and an empty API-key permission mask return
+  enveloped `400`s.
+- **Permissions (multi-actor)** - the second user acts with their own token: a
+  non-member cannot read the private org; the built-in `View` role grants read
+  but is rejected (enveloped `403`) on settings edit, project create, member
+  add, and org delete; promotion to `Admin` unlocks the settings edit.
+- **State export (`GET /admin/state`)** - rejected (`403`) for a non-superuser;
+  after elevating `operator` to superuser in the DB, the JSON format returns the
+  seeded org/project/cache with secret `*_file` fields redacted to `null`, and
+  the default Nix format renders the same resources as a pasteable expression.
+
+The auth surface is rate-limited (burst 5, one token per 6s), so the script
+spaces its registration/login calls to stay within the bucket.
+
+Out of scope (covered by dedicated tests or requiring external services):
+OIDC, SMTP e-mail verification, forge webhooks, the worker proto protocol,
+the Nix binary-cache serving family, and build-request dispatch.
+
+## State export endpoint (#188)
+
+`backend/gradient-state/src/export.rs` unit tests cover the secret-redaction pass
+(`redact` nulls every `*_file` key at any nesting depth) and the JSON→Nix
+renderer (string escaping for `"`, `\`, `${`, and newlines; identifier vs.
+quoted attribute keys; nested attrsets/lists; empty `{ }`/`[ ]`; and the header
+comment).
+
+`backend/web/tests/admin_state.rs` drives `GET /api/v1/admin/state` through the
+router: a non-superuser gets `403`, an unknown `format` gets `400`, and a
+superuser over an empty database gets the eight top-level state keys (JSON) and
+a `text/plain` Nix body (default). The full round-trip against real data lives
+in the NixOS API integration test above.
+
+## Failure handling and retries (#244)
+
+Builds can fail in three distinct ways: `FailedPermanent` (builder exited
+non-zero, terminal), `FailedTransient` (OOM / disk full / network error /
+builder crash, retried automatically with exponential backoff), and
+`FailedTimeout` (wall-clock or silent-output timeout exceeded, terminal).
+Server-wide defaults (`GRADIENT_BUILD_MAX_ATTEMPTS`,
+`GRADIENT_BUILD_RETRY_BACKOFF_SECS`, `GRADIENT_BUILD_DEFAULT_TIMEOUT_SECS`,
+`GRADIENT_BUILD_DEFAULT_MAX_SILENT_SECS`) can be overridden per-derivation
+via the `.drv` attributes `timeout`, `maxSilent`, and `preferLocalBuild`.
+
+### `Derivation::build_meta()` parsing - `core/src/db/derivation.rs`
+
+Run with: `cargo test -p core --lib db::derivation`
+
+- `build_meta_reads_all_fields` - all four attributes (`timeout`,
+  `maxSilent`, `preferLocalBuild`, `requiredSystemFeatures`) are parsed
+  into a `BuildMeta` with the correct values.
+- `build_meta_defaults_when_absent` - a derivation with none of the
+  attributes returns all-default `BuildMeta`.
+- `build_meta_prefer_local_build_accepts_true_and_1` - both `"true"` and
+  `"1"` are accepted as `prefer_local_build = true`.
+- `build_meta_ignores_unparseable_timeout` - a non-integer `timeout`
+  attribute falls back to `None` instead of erroring.
+
+### Build state-machine transitions - `core/src/state_machine/build.rs`
+
+Run with: `cargo test -p core --lib state_machine::build`
+
+- `build_sm_building_to_failed_transient` - `Building → FailedTransient`
+  is a valid transition (worker classified the failure as transient).
+- `build_sm_failed_transient_to_queued_for_retry` - `FailedTransient →
+  Queued` is valid (scheduler re-queues for the next attempt).
+- `build_sm_failed_transient_to_permanent_when_exhausted` - `FailedTransient
+  → FailedPermanent` is valid (attempt budget exhausted).
+- `build_sm_failed_transient_is_not_terminal` - `FailedTransient` is not
+  terminal; the state machine permits outgoing edges from it.
+- `build_sm_failed_permanent_and_timeout_are_terminal` - `FailedPermanent`
+  and `FailedTimeout` are terminal; no outgoing transitions are accepted.
+- `build_sm_terminal_failure_rejects_requeue` - attempting to transition
+  either terminal failure status back to `Queued` is rejected.
+- `build_sm_building_to_substituted` - `Building → Substituted` is valid, so
+  a worker that finds the outputs already valid can finalize the build as
+  `Substituted` rather than `Completed` (issue #303).
+
+### Retry decision and backoff - `scheduler/src/build.rs`
+
+Run with: `cargo test -p scheduler --lib build::retry_tests`
+
+- `permanent_is_terminal_regardless_of_attempt` - `FailedPermanent` is
+  never retried regardless of the current attempt count.
+- `timeout_is_terminal` - `FailedTimeout` is never retried.
+- `transient_retries_until_budget_then_permanent` - `FailedTransient`
+  retries while attempts remain; once the budget is exhausted the outcome
+  is `FailedPermanent`.
+- `backoff_grows_per_attempt` - the retry delay doubles with each attempt
+  (exponential backoff).
+- `substitute_unavailable_requeues_penalty_free` - a `SubstituteUnavailable`
+  failure always maps to `FailureOutcome::Requeue` (back to `Queued`, no
+  `attempt` bump), regardless of the attempt count.
+- `substitute_miss_requeues_but_real_failures_cap_at_three` - documents the
+  interaction: substitute misses never consume the attempt budget (always
+  `Requeue`), while real transient failures hit `FailedPermanent` at attempt 2
+  (with `build_max_attempts = 3`).
+
+### Substitute-miss escalation - `scheduler/src/build.rs`
+
+Run with: `cargo test -p scheduler --lib build::waiting_reason_tests`
+
+- `substitutable_below_threshold_is_buildable_anywhere` - a substitutable build
+  under `SUBSTITUTE_MISS_ESCALATION_THRESHOLD` misses is buildable-anywhere
+  (substitute mode) and never appears in the waiting reason.
+- `substitutable_at_threshold_escalates_to_real_arch_check` - once a
+  substitutable build reaches the threshold it is checked against its real
+  arch/features; with no matching arch worker it is not buildable-anywhere and
+  surfaces as an unmet requirement so the parker can park the eval.
+
+### Substitute-miss state transition - `gradient-db/src/state_machine/build.rs`
+
+- `build_sm_building_to_queued_for_substitute_requeue` - a `Building` substitute
+  attempt may transition back to `Queued` (penalty-free re-queue).
+
+### Per-build limit resolution - `scheduler/src/dispatch.rs`
+
+Run with: `cargo test -p scheduler --lib dispatch::limit_tests`
+
+- `per_drv_overrides_default` - a non-zero per-derivation limit takes
+  precedence over the server default.
+- `zero_means_no_limit` - a stored value of `0` is treated as no limit
+  (`None`), not as `0`.
+- `falls_back_to_default_when_absent` - when no per-derivation value is
+  present, the server default is used.
+
+### Worker failure classification - `worker/src/executor/build.rs`
+
+Run with: `cargo test -p worker --lib executor::build::classify_tests`
+
+- `builder_nonzero_is_permanent` - a non-zero builder exit code maps to
+  `BuildFailureKind::Permanent`.
+- `oom_signature_is_transient` - a log line matching the OOM heuristic
+  maps to `BuildFailureKind::Transient`.
+
+A substitute miss (`external_cached` build whose `fetch_external_cached_outputs`
+fails) reports `BuildFailureKind::SubstituteUnavailable` and never falls back to
+a local build - see `BuildError::substitute_unavailable`.
+
+### Entity helpers - `entity/src/build.rs`
+
+Run with: `cargo test -p entity --lib build`
+
+- `is_failure_covers_all_failure_states` - `FailedPermanent`,
+  `FailedTransient`, and `FailedTimeout` all return `true` from
+  `is_failure()`.
+- `terminal_failure_excludes_transient` - `FailedTransient` returns
+  `false` from `is_terminal_failure()` (it will be retried); `FailedPermanent`
+  and `FailedTimeout` return `true`.
+
+## Closure size graph - issue #242
+
+### Closure builder - `backend/web/src/endpoints/builds/closure.rs`
+
+- `build_closure_graph_sums_and_links` - the closure builder walks the
+  dependency closure, sums per-derivation NAR sizes into an exact
+  `total_size_bytes`, orders nodes largest-first, and emits one edge per
+  in-closure dependency (`source` = dependency, `target` = dependent).
+
+The shared `derivation_closure_reachable` / `sum_output_sizes` helpers (lifted
+out of `projects/metrics.rs`) keep their existing coverage in
+`backend/web/src/endpoints/projects/metrics.rs` (`sum_output_sizes_*`).
+
+### Shared closure-size helper - `backend/gradient-db/src/closure.rs`
+
+`transitive_closure_size` is the single source of truth for build-closure NAR
+size; both the web closure endpoint and the scheduler's dispatch backfill call
+it.
+
+- `sums_closure_output_sizes` - walks a root→child dependency graph and sums the
+  coalesced per-derivation output sizes (100 + 40 = 140).
+- `empty_roots_is_zero` - an empty root set yields a zero total without touching
+  the DB.
+
+The scheduler's lazy backfill (`BuildDispatchMaps::backfill_closure_size`)
+computes the size once per derivation when `derivation.closure_size` is NULL,
+persists it onto the row, and caches it in the dispatch maps so a dispatch pass
+never recomputes; integration coverage rides on the existing dispatch tests,
+whose MockDatabase fixtures pre-set `closure_size` to skip the walk.
+
+### Closure Sankey model - `frontend/.../closure-graph/closure-aggregate.spec.ts`
+
+`buildClosureSankey` turns the closure DAG into a flow-conserving tree:
+
+- accumulates each node's subtree size so a node carries its full closure size.
+- values links by the dependency's subtree size, pointing dependency → consumer.
+- tree-ifies a shared dependency onto a single parent (first reached by the
+  breadth-first walk from the roots).
+- buckets nodes outside the top `N` into a per-parent `others` node attached to
+  their nearest kept ancestor.
+- adds no bucket nodes when the whole closure fits within `N`.
+- treats nodes unreachable from any root (their consumer was truncated
+  server-side) as their own top-level roots.
+
+## Worker host metrics - issue #304
+
+Backend (`cargo test -p worker --bins metrics::`):
+
+- `cpu_core_score_in_bounds_and_positive` - the deterministic single-core
+  micro-benchmark (`cpu_core_score`) always returns a value in `1..=100_000`.
+- `host_static_reports_nonzero` - `host_static` reports at least one CPU and at
+  least 1 MiB of total RAM.
+
+`host_static` (logical CPU count, total RAM) is sampled once and advertised via
+`WorkerCapabilities`; `host_dynamic` (available RAM, global CPU usage) is sampled
+each heartbeat off the dispatch thread and sent via `WorkerMetrics`.
+
+## History-based prediction - issue #304 (Phase 5.3)
+
+Backend (`cargo test -p scheduler --tests history::`):
+
+- `buckets_are_log2_of_mb` - `closure_bucket` maps closure bytes to a
+  log2-of-megabytes bucket (1 MiB → 0, 4 MiB → 2, 1000 MiB → 9).
+- `empty_rows_yield_default` - `summarize` over no rows returns the zeroed
+  `HistoryPrediction` (samples 0).
+- `summarize_aggregates_peak_cpu_and_oom` - peak RAM is the max of non-null
+  samples (few-sample fallback for p95), CPU time is the mean of non-null
+  samples, and `oom_rate` is the fraction of OOM-killed rows.
+- `bucket_bounds_widen_by_one_bucket_each_side` - the byte bounds passed to the
+  `derivation_metric` query span ±1 closure bucket around the target size.
+
+`scheduler::history::predict` queries the most recent 200 `derivation_metric`
+rows for a `pname` (narrowed to comparable closure sizes when known), index-served
+by `idx-derivation_metric-pname-closure_size`. `BuildDispatchMaps` preloads one
+prediction per candidate derivation outside the scoring lock; `take_best_of_kind`
+feeds each build's prediction to the lazy `history` provider. On build completion,
+`BuildStateHandler::record_metrics` inserts a `derivation_metric` row from the
+worker's `BuildMetrics` and adopts the worker-measured `build_time_ms`.
+`summarize` also averages the rows' `build_time_ms` into
+`HistoryPrediction.build_time_ms` (same null-filter/mean as `avg_cpu_time_ms`),
+which `take_best_of_kind` uses to work-weight each org's active-build share.
+
+### Negative-total dispatch gate (`scheduler::jobs`)
+
+`take_best_of_kind` now refuses to dispatch the best candidate when its total
+score is `< 0` (e.g. a build still awaiting candidate scores, which the
+`RescoreWaitRule` drives to `-1000`); the worker idles that round instead.
+
+- `dispatch_skips_all_negative` - an unscored build (no `missing_nar_size`,
+  `rescore_count` 0) totals negative, so the gate returns `None` and leaves it
+  pending.
+- `dispatch_picks_non_negative` - a fully-cached build (`missing_nar_size` 0)
+  earns the `MissingNarSizeRule` bonus and is dispatched.
+- `unscored_build_is_gated_until_scored` - the same build is gated until the
+  worker reports zero missing paths, then assigns.
+
+## Log compression, chunking, limiting & store-fetch (#246)
+
+Completed build logs are zstd-compressed into line-bounded chunks at finalize and
+served lazily by chunk, line range, or streaming search. Workers cap log
+throughput with two token buckets and fetch nix-store logs for already-built
+derivations.
+
+**`core::storage::sgr` (`SgrState`)** - ANSI SGR carry-forward: `to_prefix()` is
+empty for the default state, reconstructs an active foreground colour, clears on
+reset (`\e[0m`), combines bold+colour minimally, handles 256-colour sequences,
+and ignores an incomplete escape at end of input.
+
+**`core::storage::log_chunk`** - `chunk_log` splits on line boundaries respecting
+the byte target, keeps an over-long line whole, carries the active colour as each
+chunk's `color_prefix`, and yields no chunks for an empty log.
+`compress_and_store_chunks` zstd-encodes each chunk, writes it via `LogStorage`,
+and the round-trip (`read_chunk` → `zstd::decode_all`) reproduces the chunk text.
+
+**`core::storage::log` chunk objects** - `write_chunk`/`read_chunk`/`delete_chunks`
+round-trip on `FileLogStorage`; `read` reassembles from chunks once the inline log
+is dropped (`delete_inline_log`), so full-log reads and dedup keep working.
+
+**`worker::executor::log_limit` (`LogRateLimiter`)** - admits bytes under the
+limit, trips permanently on a burst (1-minute bucket exhausted), trips on the
+sustained (1-hour) bucket even when the burst bucket would allow, and refills the
+minute bucket over elapsed time while not yet tripped.
+
+**`worker::nix::log`** - `store_log_path` computes
+`$NIX_LOG_DIR/drvs/<first2>/<rest>.bz2` from a drv store path (and a bare
+basename); `read_store_build_log` bzip2-decodes the stored log or returns `None`.
+
+**`web::endpoints::builds::log_chunks`** - `parse_line_range` accepts `start`/`end`,
+defaults the start to 1, parses `L120-L130` and bare `3-8`, and rejects malformed
+ranges. (The chunk/line/search endpoints' full request/response behaviour is
+covered by CI integration tests, not run locally.)
+
+**Frontend `log-window`** - `parseLineFragment` parses `#L`-style deep-link
+fragments and rejects garbage/non-positive; `chunkIndexForLine` maps a line to its
+chunk index (or `-1`); `windowAround` centres and clamps a fetch window to the log
+bounds and handles empty logs. Run a single spec with
+`pnpm exec vitest run <file> --globals --environment node`.
+
+**CLI** - `gradient builds log <id>` keeps streaming parity (the server's
+`GET /log` reassembles chunks); `--lines L120-L130` fetches a line range and
+`--search <term>` streams matches.
+
+## Runtime closure (#338)
+
+**`core::db::runtime_closure`** - `parse_reference_hash` strips the `-name`
+suffix from a `hash-name` reference token; `runtime_closure_reachable` walks
+`cached_path.references` and sums NAR sizes, deduping diamonds and returning zero
+for empty seeds.
+
+**`web::endpoints::builds::closure::runtime_closure_graph_sums_and_links`** -
+`build_runtime_closure_graph` sums sizes, keys nodes by store-path hash, and
+emits `source` → `target` edges (referrer depends on reference).
+
+**Frontend `closure-graph`** - the view requests the runtime closure by default
+and the build-time closure only under `?type=build` (eval scope uses the eval
+runtime endpoint).
+
+## Cache storage limits (#216)
+
+Per-instance (`GRADIENT_MAX_STORAGE_GB`) and per-cache (`max_storage_gb`, GB,
+0 = unlimited) storage caps. When every writable cache for an org has less than
+10 MiB headroom, new evaluations park in `Waiting` with `CacheStorageFull`.
+
+- **`core::types::waiting_reason::tests::cache_storage_full_round_trip`** - the
+  `CacheStorageFull` reason serialises to `kind=cache_storage_full` and decodes
+  back.
+- **`core::db::cache_storage::tests`** - `zero_limit_is_unlimited`,
+  `headroom_bounded_by_tighter_axis`, `headroom_instance_axis_can_dominate`,
+  `both_unlimited_is_max` cover the GB→bytes conversion and the per-cache /
+  instance headroom math (the decision input for the gate).
+- **`core::ci::apply::tests::storage_gate_ignores_non_queued_eval`** -
+  `park_if_storage_full` returns an already-`Waiting` eval untouched, issuing no
+  cache queries. The `no_eval_capable_worker_parks_*` flow also exercises the
+  gate's not-full pass-through.
+- **`core::ci::unpark::tests::unpark_storage_full_requeues_when_headroom_returns`**
+  - a `CacheStorageFull`-parked eval is re-queued once the org regains headroom.
+- **`core::types::cli::storage::tests`** - `default_max_storage_gb_is_unlimited`
+  / `clap_default_max_storage_gb_is_zero` pin the `0` default.
+- **`web::endpoints::caches::management::tests`** -
+  `validate_max_storage_gb_accepts_zero_and_positive` /
+  `validate_max_storage_gb_rejects_negative` cover the API validator. Full
+  create/patch/get round-trips of `max_storage_gb` run in CI integration tests.
+
+## Job Board & metrics rework (#343)
+
+Unit tests landed with the implementation:
+
+- **`entity::model_default_tests`** - default-row tests for the six new tables
+  (`phase_event`, `dispatched_job`, `worker_sample`, `worker_connection`,
+  `acknowledged_derivation`, `metric_rollup`) plus the new build/evaluation
+  phase-timestamp columns defaulting to `NULL`.
+- **`entity::ids`** - `new_metrics_ids_round_trip` covers the new id newtypes.
+- **`score::policy::tests::score_detailed_sums_to_total_and_names_rules`** -
+  the per-rule `ScoreBreakdown` sums to `score()` and names every rule.
+- **`core::types::cli::metrics::tests`** - pipeline config defaults.
+
+Integration coverage to run in CI (DB-backed `axum_test` / `MockDatabase`):
+
+- Phase-timestamp + `phase_event` writes on build/eval status transitions
+  (`update_build_status` / `update_evaluation_status`).
+- `dispatched_job` row written on assignment with a non-empty `score_breakdown`.
+- `worker_connection` open/close and `worker_sample` heartbeat rows.
+- Rollup aggregator fact→`metric_rollup` minute buckets + min→hour→day→week
+  cascade; retention pruning by age/granularity.
+- `GET /metrics/query` and `/board/*` scope masking (superuser vs member vs
+  anonymous); `/board/live` event masking; superuser-only acknowledged-derivations.
+
+Frontend specs (vitest, run in isolation): `board.service`, `board-live.service`
+reconnect, `metric-chart`, and the live-jobs scoring-breakdown drawer.
+
+## Rollup references build_attempt timestamps
+
+The Build/BuildAttempt split moved `build_started_at`/`build_finished_at` to
+`build_attempt`, so the rollup queries spammed `column b.build_finished_at does
+not exist`. `rollup::tests` (`cargo test -p gradient-db`) guard the schema
+coupling: `build_table_rollups_avoid_moved_columns` asserts no build-table
+rollup references the moved columns (counts now bucket by `build.updated_at`),
+and `duration_rollup_reads_timestamps_from_build_attempt` asserts
+`builds.duration_ms` sources start/finish from the latest `build_attempt`. The
+job-board durations heatmap (`board_metrics::get_board_durations_heatmap`) had
+the same stale `b.build_finished_at`/`b.build_time_ms` references and now reads
+both from the latest `build_attempt` via the same `LATERAL` join.
+
+## Storage gate SUM decodes as BIGINT (#350)
+
+`core::db::cache_storage::tests::file_size_sum_casts_to_bigint` asserts the
+generated SQL wraps `SUM(file_size)` in `CAST(... AS bigint)`. Postgres widens
+`SUM(int8)` to `NUMERIC`, which failed to decode into `Option<i64>` and surfaced
+as an Internal Server Error when manually triggering an evaluation for an org
+with a writable cache.
+
+## Multi-line evaluation warnings preserved (#351)
+
+`worker::nix::eval_worker::tests::parse_warnings_keeps_multiline_warning` and
+`parse_warnings_splits_distinct_and_drops_sqlite_busy` cover the captured-stderr
+parser: a `warning:` line plus its following lines (until the next
+`warning:`/`trace:`/`error:`/`note:` entry) are kept as one warning, so
+multi-line warnings are no longer truncated to their first line, while distinct
+warnings still split and the `SQLite database … is busy` line is still dropped.
+
+## Declarative state apply - gradient-api NixOS test (#347)
+
+`nix/tests/gradient/api` declares a full `services.gradient.state` (users with a
+superuser, organization with members, a state-managed role, a project with
+non-default fields and polling+time triggers, a cache with members/role/upstream,
+an API key, a worker registration, and inbound+outbound integrations) and
+Phase 8d of `test.py` asserts each resource was provisioned by the startup state
+actor. It also checks the API key's bearer token authorizes while its
+`viewOrg`-only mask rejects a settings mutation, and (for #349) that
+`LimitMEMLOCK` is raised and no `mlock failed` warning appears in the journal.
+
+## Chunked `IN` queries under the Postgres param cap (#345)
+
+`core::db::chunked::tests` cover `fetch_in_chunks`: a list at or below `IN_CHUNK_SIZE`
+runs a single query, a larger list splits into `ceil(n / IN_CHUNK_SIZE)` chunks each
+within the cap while preserving every id, and an empty list runs no query.
+`core::db::status::find_active_leaders_tests::chunks_large_id_lists_under_postgres_param_cap`
+drives `find_active_leaders` with 70000 derivation ids and asserts no executed
+statement binds more than 65535 parameters (regression for the `/evaluate` 500
+"too many arguments for query").
+
+## Per-resource live WebSocket filtering (#345)
+
+`web::endpoints::live::tests` cover the channel predicates: the evaluation channel
+forwards only events for its `evaluation_id`, the project channel learns evaluation
+ids from `evaluation_status_changed` events and then forwards their
+`build_status_changed` events (ignoring other projects), and `cache_changed`
+serializes to the `{"type":"cache_changed"}` ping.
+
+## Frontend live service (#345)
+
+`frontend .../core/services/live.service.spec.ts` stubs `WebSocket` and asserts
+`LiveService.connect(path)` builds the correct `ws(s)://…${apiUrl}${path}` URL,
+emits parsed JSON frames, ignores malformed frames, and closes the socket on
+unsubscribe.
+
+## Frontend issues batch (#341)
+
+Frontend (`pnpm --dir frontend exec ng test --include='<glob>' --watch=false`):
+- `evaluation-log/build-search.spec.ts` - `matchesBuildSearch` is a case-insensitive
+  substring match; empty/whitespace query matches all.
+- `evaluation-log/evaluation-log.component.spec.ts` - `renderLog` updates
+  `logLineCount` (live count on building builds); the sidebar search filters
+  `groupedBuilds` by name while preserving the `visibleBuilds` index used for
+  keyboard navigation.
+- `core/services/admin.service.spec.ts` - `startDeepGc`/`listTasks` hit the
+  `admin/maintenance/deep-gc` and `admin/tasks` endpoints; `githubAppConfigured`
+  resolves true/false from the credentials probe.
+- `board/health/health.component.spec.ts` - the HTTP-routes table is gone, the
+  admin tasks table renders, and the GitHub link reflects the configured state.
+- `board/live-jobs/live-jobs.component.spec.ts` - the view toggle loads and
+  renders the pending-jobs list.
+
+Backend (`cargo test -p scheduler --tests jobs`):
+- `pending_snapshot_reports_kind_and_org` - `JobTracker::pending_snapshot` reports
+  each pending job's kind, org, and build-id, backing `GET /board/jobs/pending`.
+
+## Scheduler - windowed instance context (#359)
+
+`instance_metrics_loop` recomputes a `score::InstanceContext` snapshot every
+`GRADIENT_INSTANCE_METRICS_INTERVAL` seconds (default 30) from
+`derivation_metric` + `dispatched_job` over 5m/1h/24h windows and publishes it
+lock-free via `arc_swap::ArcSwap`; `try_assign` feeds the live snapshot into
+`take_best_of_kind` instead of `InstanceContext::default()`.
+
+Backend (`cargo test -p scheduler --tests instance`):
+- `maps_columns_and_counts_into_snapshot` (`scheduler::instance`) - a
+  `MockDatabase` replays raw column maps for the two windowed statements;
+  asserts each column lands in the right `Windowed`/count field and that the
+  in-memory `InstanceCounts` (active/pending builds, total/idle workers) are
+  copied through. The FILTER-window and jsonb-extraction SQL is validated in CI
+  against Postgres, not by the mock.
+
+## Scheduler - instance-relative scoring rework (#359)
+
+Soft rules return a bounded `[0,cap]` bonus with instance-relative thresholds;
+disqualifiers may go negative; `take_best_of_kind` refuses a negative total.
+
+Backend (`cargo test -p score`):
+- `missing_nar_size_bounded_bonus` (`score::rules::builtin`) - `None` scores 0,
+  a fully-cached job hits the 500 cap, and a huge NAR stays `>= 0` and below the
+  cached bonus.
+- `dependency_count_capped_at_50` (`score::rules::builtin`) - 100k dependencies
+  saturate at the 50 cap.
+- `wait_time_longer_wait_scores_higher_but_capped` (`score::rules::builtin`) -
+  wait measured from `ready_at` grows monotonically and saturates at the rule
+  cap, clearing the anti-starvation budget.
+- `rescore_wait_blocks_build_until_threshold_but_never_eval`
+  (`score::rules::builtin`) - an unscored build scores `-1000` at
+  `rescore_count` 0, drops to 0 at 4, is 0 once `missing_nar_size` is known, and
+  is always 0 for eval jobs.
+- `fair_share_breaks_tie_at_equal_wait` (`score::rules::fair_share`) - at equal
+  wait the quieter org's job outscores the busier org's, fair-share + wait
+  combined.
+- `aggregate_len1_is_identity_and_multi_reduces` (`score::context`) -
+  `BuildContext::aggregate` is identity for one item; multi-item folds
+  dependency/closure sums, OR of prefer-local/fixed-output, max/min/mean history
+  fields and concatenated derivations.
+
+Backend (`cargo test -p scheduler`):
+- `bump_rescore_increments_pending_only` (`scheduler::jobs`) -
+  `bump_rescore_counts` raises pending jobs' `rescore_count` but leaves an
+  assigned (active) job at 0.
+
+Frontend (`frontend/.../board/job-detail/job-detail.component.spec.ts`) -
+structured context panels: renders worker `cpu_count`, a derivations row
+(`pname`/`drv_path`), the job-context kind + history `peak_ram_mb`, and the
+instance-context windowed table with scalar counts.
+
+## Job & worker context fixes (#366)
+
+The dispatched-job detail now hides the server-only `core`/`cache` capability
+flags and the redundant standalone `fetch` row, shows the job-context
+architecture only for build jobs, links the worker id to its org-scoped metrics
+page (`organization_name` is now part of `DispatchedJobDetail`), makes the
+derivation rows the build entry-point, and falls back to a limited view (or a
+"Job not found" message) when a queued job has no dispatch record yet. The live
+board persists its tab/filter selection in `sessionStorage` and reconciles the
+optimistic live rows with the persisted, selectable rows shortly after a
+dispatch event.
+
+Frontend (`board/job-detail/job-detail.component.spec.ts`) - capability list
+excludes `core`/`cache` and has no separate `Fetch` row; architecture renders
+for build jobs and is hidden for eval jobs; the worker id links to
+`/organization/{org}/workers/{id}/metrics`; an undispatched job renders the
+pending view without a scoring breakdown, and an unknown id renders "Job not
+found".
+
+Frontend (`board/live-jobs/live-jobs.component.spec.ts`) - the view/filter
+selection round-trips through `sessionStorage`: a persisted `pending` view is
+restored on load and switching the tab writes it back.
+
+## Minor frontend & job board fixes (#375)
+
+Frontend tests documenting UI improvements to the action form, live jobs list, and job detail page:
+
+- `action-form.component.spec.ts` - `forge_status_report` actions submit an empty `events` array; submit errors render inside the action dialog.
+- `live-jobs.component.spec.ts` - dispatched/pending job rows show the derivation `pname`.
+- `job-detail.component.spec.ts` - the "Previous Build Attempts" section renders only when a build has more than one attempt, one linked row per attempt.
+
+## Virtualized live log streaming
+
+The evaluation-log page renders streaming (Building) logs through the same
+virtualized window as chunked (Completed) logs, sourced from memory instead of
+the chunk API. Each drain tick converts and mounts only the newly received
+lines - previously the entire log was ANSI-converted and re-parsed into one
+`innerHTML` every 80 ms, which saturated the main thread on high line counts.
+
+Frontend (`evaluation-log/evaluation-log.component.spec.ts`,
+`pnpm -C frontend exec ng test --include '**/evaluation-log/*.spec.ts' --watch=false`):
+- `appendStreamedLines` updates `logLineCount` (live count on building builds).
+- only newly streamed lines run through `convertAnsiToHtml`; the window keeps
+  appending with stable line numbers.
+- the rendered window is capped at `MAX_WINDOW` lines, with trimmed lines
+  represented by the top spacer.
+- with auto-scroll off the window stays pinned: new lines only grow the bottom
+  spacer and the line count.
+- scrolling up during streaming pages older lines from the in-memory log
+  (`loadWindow` prepend) with correct numbering and spacer heights.
+
+## Project page redesign - status rollups & dependency counts (#295)
+
+- `backend/gradient-web/src/endpoints/projects/mod.rs::rollup_tests` - `bar_segment` maps every `BuildStatus` to the correct segment, and `BuildStatusCounts::total()` excludes `Substituted`/`Aborted`.
+- `backend/gradient-web/src/endpoints/projects/evaluations.rs::tests::first_line_truncated_takes_first_line_and_caps_length` - commit-message first non-blank line extraction and 100-char cap.
+- `backend/gradient-web/src/endpoints/live.rs::tests::project_channel_forwards_build_transitions_for_seeded_evals` - the project live channel forwards build transitions for evaluations seeded at upgrade, so segmented bars/queue move while builds run.
+- Frontend `segmented-bar.component.spec.ts` - all four segments render with widths proportional to the four-segment total (substituted/aborted excluded; zero counts render at 0% width so live count changes animate); work finished entirely via substitution renders a single full green segment; all-zero counts render a grey track; hovering a segment shows an instant custom tooltip with its count.
+- Frontend `project-detail.component.spec.ts` - explicit eval selection is persisted in the `eval` query param (back-navigation restores it) and `barCounts` folds the entry point's own build status into its dep-closure counts.
+- `backend/gradient-web/src/endpoints/projects/evaluations.rs::tests::checked_at_maps_null_time_sentinel_to_none` - `last_check_at` epoch sentinel (re-check pending) serialises as `null`, not 1970.
+- SQL helpers in `gradient-db/src/project_board.rs` (grouped counts, queue summary, dependency-closure CTE) are covered end-to-end by CI; no local DB unit harness exists.
+
+## Live evaluation progress (#295)
+
+Build/dependency totals now grow live during evaluation: the backend was silent
+while the evaluator inserted build rows (no status change), so the project and
+evaluation pages stayed frozen until the eval phase finished.
+
+- `backend/gradient-web/src/endpoints/live.rs::tests::eval_channel_matches_only_its_evaluation`
+  and `project_channel_forwards_progress_and_learns_its_eval` assert the new
+  `evaluation_progress` frame is forwarded on the `/evals/{id}/live` and
+  `/projects/{org}/{project}/live` channels (and learnt into the project
+  channel's known-eval set), while a progress ping for another evaluation /
+  project is dropped.
+- `backend/gradient-scheduler/src/eval.rs::handle_eval_result` emits
+  `BoardEvent::EvaluationProgress` after each batch of builds/entry-points is
+  persisted, so the silent insert phase no longer leaves the UI frozen.
+
+## Substituted-build log fallback
+
+`backend/gradient-web/src/endpoints/builds/mod.rs::effective_log_id` resolves the
+build whose stored log the `/builds/{id}/log*` endpoints serve: a `Substituted`
+build has no log of its own, so it falls back to the most recent prior build of
+the same derivation that does (chunked or inline). Read-side, DB-dependent;
+covered end-to-end by CI, no local DB unit harness.
+
+## Entry-point dependency-closure counts (#383)
+
+Replaces the per-request recursive closure CTE (`entry_point_dep_counts`) with an
+incrementally-maintained cache: a derivation's build-time closure is materialised
+once into `derivation_closure` (content-addressed, size cached on
+`derivation.dep_closure_count`), and each entry point's per-status histogram is
+kept in `entry_point_dep_count`, seeded at eval-completion and updated on every
+build status transition.
+
+- `backend/gradient-db/src/dep_closure.rs::tests::load_groups_rows_by_entry_point_and_status`
+  and `load_returns_empty_when_no_counts_maintained` cover the read assembly and
+  the empty-result signal that drives the web fallback (`MockDatabase`).
+- `backend/gradient-scheduler/src/handler_tests.rs` Group E
+  (`eval_job_completed_*`) gains a `seed_entry_point_dep_counts` no-entry-points
+  query in each `handle_eval_job_completed` mock sequence.
+- SQL-level behaviour - closure materialisation, the `apply_dep_count_delta`
+  old→new shift, the delete-then-reinsert `init`, and the read-path maintained vs
+  CTE-fallback branch - is DB-dependent and covered end-to-end by CI (no local
+  Postgres unit harness; counts are atomic per-row, deltas are spawned, and
+  restart reconciliation recomputes in-flight evals).
+- The incremental deltas fire only from the single-row status hook; every bulk
+  status path (`promote_ready`/`promote_dependents`/`cascade_dependency_failed`/
+  `requeue_failed_anchors`) moves anchors with raw SQL that bypasses it, so the
+  live histogram drifts. `check_evaluation_done` runs an authoritative
+  `reconcile_eval_dep_counts` on the terminal transition (alongside the existing
+  abort/startup/read-when-empty reconciles), so a settled eval's bar always
+  matches its final graph regardless of which bulk paths ran. Covered E2E by CI.
+
+## Pre-build Waiting state for missing fetch/eval workers (#381)
+
+The scheduler parks an evaluation in `Waiting` while it cannot make progress and
+names the missing capability: a `Fetching` eval needs a `fetch`-capable worker,
+`Queued`/`EvaluatingFlake`/`EvaluatingDerivation` need an `eval`-capable one. The
+park happens even when the eval has already batched some build rows (the previous
+build-phase reconciler skipped that case), and recovers to `Queued` once the
+capability returns. The reason is the `eval_workers` `WaitingReason` variant.
+
+- `backend/gradient-types/src/waiting_reason.rs::tests::eval_workers_round_trip_carries_capability`
+  - JSON round-trips the `fetch`/`eval` variants under `kind == "eval_workers"`.
+- `backend/gradient-scheduler/src/build.rs` waiting-reason tests:
+  - `pre_build_target_queued_no_eval_worker_stalls_to_eval_waiting` and
+    `pre_build_target_fetching_no_fetch_worker_stalls_to_fetch_waiting` - the
+    capability split (an eval-only pool still strands a `Fetching` eval).
+  - `pre_build_target_active_pre_build_with_capability_left_alone` and
+    `pre_build_target_ignores_waiting` - no-op while progressing / for `Waiting`.
+  - `eval_recovery_unparks_to_queued_when_capability_returns` and
+    `eval_recovery_refreshes_reason_while_capability_absent` - the `Waiting`
+    recovery decision.
+- `frontend/.../evaluation-log.component.spec.ts` `eval_workers waiting reason`
+  block - titles/messages for the fetch, eval, and full-cache stalls.
+- The full DB-driven reconcile sweep (build-phase buildability + status
+  transitions) is covered end-to-end by CI (no local Postgres unit harness).
+
+## Chunked cache upload (#390)
+
+`gradient cache upload` splits each NAR into 32 MiB chunks so no single request
+exceeds the bundled reverse proxy's 100 MiB body limit (which previously 413'd
+large NARs). Chunks stage to a server-side `.partial` (reusing the `#225`
+`PartialStore`) keyed by the 32-char store hash, then a finalize request
+validates and ingests the staged NAR.
+
+- `backend/gradient-web/src/endpoints/caches/upload.rs::tests` -
+  `accepts_a_normal_store_basename` / `rejects_traversal_and_separators` cover the
+  staging-key path-traversal guard.
+- `cli/src/commands/cache_upload.rs::tests::extracts_hash_from_full_path_and_name_with_specials`
+  - the URL-safe store-hash key extraction (handles `+` in store names).
+- `PartialStore` staging semantics (contiguous append, offset-0 restart) are
+  already covered under *Resumable NAR transfers (#225)*.
+- The chunk→finalize→ingest round trip is DB- and storage-dependent and covered
+  end-to-end by CI (no local Postgres unit harness).
+
+## Project page bugs: PR label, stale packages, redirect (#391)
+
+- `backend/gradient-forge/src/webhook.rs::tests::parse_github_pr_opened_event`
+  now asserts the parsed PR `title`, which becomes the evaluation's display
+  message for PR triggers (PR webhooks carry no head commit message).
+- `frontend/.../project-detail.component.spec.ts`:
+  - `labels a pull-request trigger as "PR #<n>"` - the trigger label shows the
+    PR number (from `EvaluationSummary.pr_number`) and falls back to "PR".
+  - the existing evaluation-selection specs cover the stale-packages clear on
+    switch (entry points reset + reload on `select`).
+- `frontend/.../evaluation-log.component.spec.ts` continues to pass with the
+  `takeUntilDestroyed` teardown that stops late fetches from redirecting back to
+  the log page after the user navigates away.
+- The build-list latest-attempt batching, the dep-count backfill, and the
+  `source_comment` PR-number persistence are DB-dependent and covered end-to-end
+  by CI (no local Postgres unit harness).
+
+## Memory-budgeted sharded evaluation (#386)
+
+A flake's discovery used to run as one giant single-worker `discover()` over
+every system at once, which on a large/many-system flake exceeds the RAM budget
+and never completes. Discovery is now split into one shard per system, fanned
+across a pool whose size keeps `pool_size * max_eval_rss` within a fraction of
+host RAM.
+
+- `backend/gradient-worker/src/nix/wildcard_walk.rs`:
+  - `plan_*` tests assert the per-system split mirrors `walk`'s
+    `*`/`#`/opaque/recover-one-level branches, and `assert_split_equivalent`
+    proves the union of `discover` over the shards equals one-pass `discover` for
+    trailing-`*`, non-trailing, `#`, opaque-skip, top-level and multi-include
+    patterns.
+  - `segments_to_pattern_quotes_dotted_segments_only` round-trips a shard's
+    segments (quoting only dotted names) back through `parse_pattern`.
+- `backend/gradient-worker/src/worker_pool/pool.rs::budgeted_pool_size_caps_by_memory`
+  covers the no-OOM pool sizing: capped by `ram_budget / max_eval_rss`, floored
+  at 1 (a tiny host still evaluates, one shard at a time), and divide-by-zero
+  safe.
+- The sharded `list_flake_derivations` fan-out, per-shard RSS recycle, and the
+  `EVAL_RAM_SHARE`-of-host-RAM pool sizing are exercised end-to-end by the
+  `gradient-eval` VM test (no local libnix harness).
+
+### Concurrent eval-cache without WAL deadlock
+
+Parallel shards (and concurrent evaluations of the same flake) share one
+eval-cache `<fp>.sqlite`. The nix fork splits `EvalCache::commit()` (commits the
+SQLite txn, appends to the WAL, no checkpoint, safe under concurrent writers)
+from `EvalCache::checkpoint()` (`wal_checkpoint(passive)`, folds the WAL into the
+main file without taking the exclusive read-slot lock, so it never blocks on a
+concurrent reader). Gradient calls `commit_cache()` per shard and
+`checkpoint_cache()` once at end-of-eval (before the fleet-share push), so
+neither the per-shard `@120`-vs-`@123` deadlock nor the end-of-eval truncate
+deadlock can form. The `Checkpoint` eval-op round-trips through the
+`EvalRequest`/`EvalResponse` serde tests; the concurrent-write path itself is
+covered by the `gradient-eval` VM test (needs the fork's libnix, no local
+harness).
+
+## SCIM provisioning (#384)
+
+`backend/gradient-web/tests/scim.rs` drives the `/scim/v2` surface through
+`axum_test::TestServer` against a `MockDatabase`, asserting SCIM-shaped
+`application/scim+json` responses:
+
+- **Auth** - a missing or wrong bearer token returns `401` with the
+  `urn:ietf:params:scim:api:messages:2.0:Error` body.
+- **Users CRUD** - `POST /Users` returns `201` with an `id`; duplicate `userName`
+  returns `409`; `GET /Users/{id}` returns the user; `PUT`/`PATCH` update it;
+  `GET /Users` filters by `userName eq "..."` and honours `startIndex`/`count`
+  pagination.
+- **Active toggle + delete** - `PATCH` with `active=false` deactivates;
+  `DELETE /Users/{id}` soft-disables by default (issues an `UPDATE`, not a
+  `DELETE`) and hard-deletes when `scim_hard_delete` is set.
+- **Groups** - `PATCH /Groups/{id}` add/remove members maps to
+  `organization_user` grants for the resolved `(organization, role)`; an unknown
+  group name returns `404`.
+- **Discovery** - `GET ServiceProviderConfig`/`ResourceTypes`/`Schemas` return the
+  advertised capabilities.
+- **Inactive login** - an inactive (`active=false`) user is rejected at login with
+  `403`, exercised via the auth path alongside the active guard.
+
+`gradient-types` `config.rs` unit tests cover `scim_config()` (disabled → `None`,
+enabled-without-token → `None`, fully-configured → `Some`) and `RuntimeConfig`
+propagation; `gradient-state` covers `resolve_scim_group_roles` mapping a
+`scim_group` name to its `(org, role)` grant; `scim/filter.rs` covers the
+`attr eq "value"` parser.
+
+## Open PR flake.lock updater
+
+The `open_pr` action opens/updates a pull request from a natively recomputed
+flake.lock. An `input_update` evaluation bumps the project's tracked inputs
+(override rows with `url` unset; any override with a `url` set blocks the run as
+a safety gate), verifies the candidate lock by a normal eval/build per
+`verify_gate`, then opens or updates the PR. v1 covers `github`, `gitlab`, and
+`git` flake inputs.
+
+Backend (`cargo test -p gradient-nix --lib lock`):
+- `lock_model_round_trips` - a `flake.lock` with `github`/`gitlab`/`git` nodes
+  parses into the lock model and re-serialises byte-stable, so a no-change bump
+  produces an empty patch (and opens no PR).
+
+Backend (`cargo test -p gradient-nix --lib update_input`):
+- `update_input_github` / `update_input_gitlab` / `update_input_git` - per
+  fetcher, the updater resolves the newest revision and rewrites the node's
+  `rev`/`narHash` with a natively recomputed hash (one case per supported input
+  type).
+
+Backend (`cargo test -p gradient-flake-lock --lib`):
+- `only_git_keeps_ref_in_locked` - `LockedRef::locked_keeps_ref` is true only for
+  plain `git`; the github-family schemes pin by `rev` alone.
+- `bumps_changed_input` / `drops_stale_ref_from_github_locked` - a bumped
+  `github` node never carries a `ref` in its `locked` block (nix rejects a github
+  input holding both a `rev` and a branch/tag), and an already-poisoned lock
+  heals on the next bump.
+- `keeps_ref_for_git_inputs` - a `git` node keeps its `ref` alongside the bumped
+  `rev`, matching what nix writes for that fetcher.
+
+Backend (`cargo test -p gradient-ci --lib actions::open_pr`):
+- `matcher_fires_only_on_input_update` - the action's verify-gate matcher
+  (default `build.completed`) fires for an `input_update` evaluation and is a
+  no-op for a `normal` evaluation, so ordinary runs never open a PR.
+- `tracked_inputs_collected_and_pinned_override_blocks` - tracked inputs are
+  collected from `url`-unset override rows, while the presence of any `url`-set
+  override blocks the `input_update` run.
+
+Backend (`cargo test -p gradient-forge --lib reporter::pull_request`):
+- `open_pr_creates_branch_and_pr` / `open_pr_updates_existing_in_place` - the
+  reporter's PR methods open a fresh PR and, with `update_existing`, update an
+  already-open PR in place rather than opening a duplicate.
+
+Backend (`cargo test -p gradient-nix --test narhash_corpus`):
+- `narhash_matches_nix_golden_corpus` - a golden-corpus differential test
+  compares the natively recomputed `narHash` against fixtures produced by
+  upstream `nix` for each fetcher, guarding the native hasher against drift.
+
+NixOS VM (`nix/tests/gradient/open-pr`):
+- E2E trigger-to-PR path: a trigger fires on a project with an `open_pr` action
+  and one tracked input, the worker bumps the input and verifies the candidate
+  lock, and a PR is opened on the (test) forge; a re-run with no upstream change
+  produces an empty patch and opens no second PR.
+
+## Gradient build end-to-end + nix fast paths (#422)
+
+Fixes two blocking bugs in `gradient build` (the CLI decoded a successful blob
+upload as an error; the scheduler git-cloned the materialised
+`/nix/store/<hash>-source`) and adds the `nix`-feature source NAR upload and
+post-build `result`.
+
+- `backend/gradient-storage/src/source_nar.rs::tests::from_bytes_matches_dir` -
+  `source_nar_from_bytes` computes the same store path/hashes as
+  `materialise_source_nar` for the same NAR, so the CLI and server agree on the
+  source store path.
+- `backend/gradient-scheduler/src/dispatch.rs::eval_source_tests` -
+  `cached_source_dispatches_without_fetch` dispatches a `/nix/store/...`
+  repository as `FlakeSource::Cached` with `[EvaluateFlake, EvaluateDerivations]`
+  and the source in `required_paths`; `repository_source_keeps_fetch` leaves a
+  git URL on the `FlakeSource::Repository` + `FetchFlake` path.
+- `backend/gradient-web/tests/build_requests_source.rs` -
+  `source_upload_creates_queued_eval` (multipart NAR → Queued eval, `cache` null)
+  and `source_upload_missing_nar_is_400`.
+- `backend/gradient-web/tests/build_requests_dispatch.rs` - the happy paths now
+  assert the `DispatchResponse.cache` field.
+- `cli/connector/tests/build_requests_api.rs` - `upload_blobs_decodes_counts`
+  (decodes `{uploaded,remaining}` instead of erroring on a 200) and
+  `upload_source_nar_returns_dispatch`.
+- The `nix copy`/`result` substitution and the staged NAR pack are daemon/`nix`
+  dependent and covered end-to-end by CI.
+
+## Slug umlauts, source NAR compression, CLI eval surfacing & fetch-by-SHA (#431, #435, #430)
+
+- `frontend/src/app/shared/text/slug.spec.ts` - `slugify` transliterates umlauts
+  (`NüschtOS` → `nuschtos`), expands `ß`→`ss`, strips other Latin diacritics, and
+  keeps the lowercase/hyphen/trim behaviour. Fixes #431 (`NüschtOS` → `n-schtos`).
+- `backend/gradient-storage/src/source_nar.rs::tests::compressed_bytes_round_trip_to_nar`
+  - the stored `compressed_bytes` zstd-decompress back to the raw NAR, and
+  `file_size`/`file_hash_sri` describe the compressed object. Fixes #435 "Zstd
+  decompress failed: Unknown frame descriptor" (source NAR was stored
+  uncompressed while the worker import expects `.nar.zst`).
+- `cli/connector/src/evals.rs::tests` - `deserializes_eval_without_updated_at_or_error`
+  and `deserializes_eval_with_error_message`: the CLI tolerates a server eval
+  payload that omits `updated_at`/`error` (the decode failure behind `gradient
+  watch` "Unknown evaluation" / `build` "api error (200)") and surfaces the
+  populated `error`.
+- #430 (fetch-by-SHA fallback for a commit not reachable from the cloned refs)
+  needs a live git transport, so it is covered by CI/manual rather than a unit
+  test; the worker now fetches the commit by SHA before failing with a clearer
+  "not reachable (force-pushed, GC'd, or a fork PR ref)" message.
+
+## Clickable rejected jobs on the Live Jobs board
+
+Lets a passed-over candidate in the "incl. rejected" view open the job detail
+page with its score breakdown, served from the in-memory decision ring.
+
+- `backend/gradient-scheduler/src/jobs.rs::tests::candidates_carry_ephemeral_id_and_breakdown_for_detail_lookup`
+  - every scored candidate gets an ephemeral id and per-rule `score_breakdown`;
+  `JobTracker::candidate_detail(id)` reconstructs the detail (worker/instance
+  context shared per decision) and returns `None` for an unknown id.
+- The memory-first `GET /board/jobs/{id}` resolution (ring before DB) and the
+  frontend's clickable rows + "Passed over"/"Scored" labelling are exercised
+  end-to-end by the board E2E rather than a unit test.
+
+## StorePath object + prefix-free API & server log levels (#416, #438)
+
+- `backend/gradient-entity/src/store_path.rs::tests` - `StorePath` parses both
+  full (`/nix/store/<hash>-<name>`) and bare base forms, round-trips
+  `base()`/`full()`, detects `.drv` derivations, serde-serialises to the
+  prefix-free base form (deserialising either form), and rejects malformed input.
+- `backend/gradient-web/tests/evals_artefacts.rs` and
+  `evaluation_builds_via.rs` - the public API now returns prefix-free store paths
+  (`<hash>-<name>[.drv]`) for `derivation`, output `store_path`, and the build
+  `name`.
+- `backend/gradient-web/tests/narinfo.rs` + `caches/narinfo.rs` - the Nix
+  binary-cache protocol responses (`StorePath:`/`References:`/`Deriver:`,
+  `nix-cache-info` `StoreDir`) keep the `/nix/store/` prefix, reconstructed from
+  the `cached_path` `hash`+`package` columns after the redundant `store_path`
+  column was dropped.
+- `backend/gradient-scheduler/src/views.rs::tests` - `DerivationRef.drv_path` in
+  the dispatch-decision ring is normalised to the prefix-free base form.
+- `backend/src/main.rs::tests` - `build_filter_directive` targets the renamed
+  `gradient_*` crates (`gradient_web`/`gradient_cache`/`gradient_proto`/
+  `gradient_scheduler`), bakes in dependency-noise suppression, and no longer
+  emits the dead `builder=` target. Fixes #438.
+- The migration (`m20260619_000001_drop_cached_path_store_path`), the CLI's
+  `OutputArtefacts::full_store_path` reconstruction for `nix copy`/`nix-store
+  --realise`, and the worker FFI paths are covered by CI rather than local unit
+  tests.
+
+## Direct-to-object-store NAR upload + storage/disconnect retry
+
+Stops relaying multi-GB build-output NARs through the server (which buffered each
+whole NAR and did one blocking PUT inline on the connection, freezing the worker
+session on slow object storage).
+
+- `backend/gradient-worker/src/executor/compress.rs::compress_and_push_paths` now
+  routes build outputs through `CacheQuery { Push }` + the shared
+  `executor::upload_one_nar`: a presigned S3 PUT straight to object storage when
+  S3-backed, falling back to direct `NarPush` only for local stores. A failed
+  upload propagates as a transient `BuildError`, so the build is re-dispatched.
+- `backend/gradient-worker/src/executor/mod.rs` - eval-time pushes (the `.drv`
+  closure and fetched flake inputs) now propagate upload failures via
+  `JobReporter::push_drv_closure` returning `Result`; a failed push fails the
+  evaluation with the error instead of being silently swallowed. The
+  `job_reporter` fake mirrors the new signature.
+- `backend/gradient-proto/src/handler/dispatch.rs::fail_build_transient` - a
+  server-side staged-read / size-mismatch / `nar_storage.put` failure (local
+  stores) stops the worker and marks the build `FailedTransient` so it retries,
+  without dropping the WebSocket (the dispatch loop keeps running, so the
+  worker's other in-flight jobs survive).
+- `backend/gradient-scheduler/src/jobs.rs::worker_disconnected` now returns the
+  requeued `PendingJob`s; `worker_lifecycle::unregister_worker` calls
+  `build::requeue_orphaned_jobs` to reset the DB rows of a disconnected worker's
+  in-flight jobs (`Building -> Queued`; mid-eval -> `Waiting`, recovered by the
+  reconciler) so they re-dispatch instead of stranding. Covered by the existing
+  in-memory `test_worker_disconnected_requeues` / `test_worker_disconnect_requeues_jobs`;
+  the DB reset and the worker-side orphan-task cancellation are covered by CI E2E
+  rather than the MockDatabase unit harness.
+
+## Per-org multi-installation GitHub integration (#436)
+
+GitHub is now a first-class creatable forge integration. The App remains
+server-wide; installations are per-org and multiple (one per GitHub account),
+created via `PUT /orgs/{org}/integrations` with `forge_type=github` and
+`installation_id`, or auto-created by the install webhook.
+
+`backend/gradient-ci/src/integration_lookup.rs` - `name_tests`:
+- `uses_account_login_when_present` - `github_integration_name(Some("Acme-Corp"), 42)` yields `"github-acme-corp"` (lowercased, prefixed).
+- `falls_back_to_installation_id` - `github_integration_name(None, 42)` yields `"github-42"` when no login is available.
+
+`backend/gradient-ci/src/integration_lookup.rs` - `ensure_tests`:
+- `creates_both_rows_when_none_exist` - `ensure_github_app_integrations` on an org with no existing rows inserts the inbound and outbound pair linked to the specific `github_installation`.
+- `skips_kinds_that_already_exist` - repeated calls are idempotent per installation; rows that already exist for that org/installation/kind are not duplicated.
+
+`backend/gradient-forge/src/github_app.rs` - `parses_installation_account_login`:
+- `InstallationResponse` deserialises `{"id":42,"account":{"login":"acme-corp"}}` and returns `account.login = "acme-corp"`. Guards the `get_installation` API call that validates an installation id on `PUT`.
+
+`backend/gradient-web/tests/orgs_integrations.rs`:
+- `github_create_without_app_config_is_rejected` - `PUT /orgs/{org}/integrations` with `forge_type=github` returns `400` when the server has no GitHub App configured (`GRADIENT_GITHUB_APP_ID` absent). Guards the "App must be configured" prerequisite before any installation lookup.
+- PATCH on a `forge_type=github` row returns `400`; github rows are installation-managed and not editable via PATCH (delete to remove). The `PatchIntegrationRequest.forge_type` enum excludes `github` at the schema level.
+- github rows CAN be deleted via `DELETE /orgs/{org}/integrations/{id}`; removing the row also removes the `github_installation` binding.
+
+`backend/gradient-web/tests/forge_hooks.rs` - reworked GitHub App dispatch tests routing by `github_installation` FK:
+- `github_app_webhook_push_fires_trigger` (Test 10) - a push event dispatched via a `github_installation` row fires the matching project trigger and returns one queued evaluation.
+- `github_app_webhook_installation` (Test 12) - an `installation` event for an org not found in the DB warns and returns `200` with `event="installation"` and empty queued arrays (no crash).
+- `github_app_webhook_multi_org_routes_to_matching_org` (Test 15) - a push event routes only to the org whose project URL matches the push payload; the sibling org with a different repo URL is not queued.
+- `github_app_webhook_no_matching_repo_returns_zero` (Test 16) - a push against a repo URL not tracked by any project returns `projects_scanned=0`.
+
+`backend/gradient-state/src/config.rs` - `deserializes_github_integration_with_installation_id`:
+- A `forge_type=github` entry in the `integrations` map deserialises with `installation_id` + optional `account_login`, covering the state provisioning path that links the `github_installation`.
+
+`frontend/src/app/features/organizations/integrations/integrations.component.spec.ts` - `IntegrationsComponent - create github integration`:
+- `createIntegration sends forge_type=github with installation_id` - form submit with `forge_type=github` and a numeric `installation_id` string calls `PUT` with the parsed integer.
+- `createIntegration rejects a non-integer installation_id` - a non-numeric installation id string fails client-side validation without sending a request.
+
+Migration backfill (`m20260620_*_github_installation_table`) and the `github_installation` FK wiring are verified by E2E CI against real PostgreSQL.
+
+## Eval push discovers input sources by parsing the `.drv`
+
+A real build failed `InputsUnavailable` on a `.drv`'s input source (a
+`builtins.toFile` config like `grub-config.xml`) that the evaluation never
+pushed: `push_drv_closure` discovered paths via the daemon's reference walk,
+which does not reliably report a `.drv`'s `inputSrcs`. Input sources have no
+producing derivation, so the miss could not self-heal - every re-eval re-walked
+the same way and re-failed.
+
+`backend/gradient-worker/src/executor/mod.rs` - `drv_input_sources` now parses
+each produced `.drv` and unions its `inputSrcs` into the push set (mirroring the
+build-side `InputPrefetcher::enumerate_inputs`), so every source a build worker
+will demand is pushed by the evaluation that produced it. NAR bytes already
+upload from the filesystem (`NarByteStream`), so filesystem-parsed discovery is
+sufficient.
+
+`push_drv_closure` extracts those sources from **every `.drv` in the collected
+closure**, not just its seed `.drv`s. `collect_runtime_closure` already returns the
+full nix-level closure (including subtrees gradient pruned during the BFS), so
+parsing only the seeds left a pruned/transitive node's `inputSrcs` unpushed - and
+when that node later had to rebuild (its output demoted or never fetchable), it
+failed `InputsUnavailable` forever on a producerless source only the eval worker
+held (observed live across a large multi-system flake: `etc-machine-id`,
+`X-Restart-Triggers-polkit`, `staticPaths`, `smartd-notify.sh`, vendored
+`cargo-src-*`). `drv_input_sources` parses the closure's `.drv` members
+concurrently (`buffer_unordered`) since the set is now closure-sized. Covered
+end-to-end in CI; the two `drv_input_sources_*` unit tests still pin the parse.
+
+- `drv_input_sources_parses_inputsrcs_not_via_daemon` - a `.drv` fixture's two
+  `grub-config.xml` `inputSrcs` are returned; its input *derivation* is not.
+- `drv_input_sources_skips_unreadable_drv` - a missing `.drv` is skipped, not
+  fatal (the daemon closure still covers it).
+
+## Dispatch gate requires inputSrcs cached
+
+Pushing a `.drv`'s `inputSrcs` is necessary but not sufficient: the readiness
+gate trusted only dependency *anchors*, never the sources, so a requeued anchor
+(reset to `Created` but still `edges_complete` with all deps cached) re-dispatched
+the instant the periodic `promote_ready` backstop ran - before the new evaluation
+re-pushed its sources - and failed `InputsUnavailable`. Under a perpetual abort
+the source push never won the race and the anchor poisoned to `FailedPermanent`.
+
+The fix records each derivation's `inputSrcs` in `derivation_input_source`
+(parsed from the `.drv`, persisted at `report_eval_result` via
+`persist_input_sources`, idempotent on `(derivation, hash)`) and adds a gate to
+`promote_ready`, `promote_dependents`, and `dispatch_ready_builds`: a
+non-substitutable anchor promotes/dispatches only when every source hash is
+`fully_cached` in `cached_path`. The SQL gate is covered by mirroring across the
+three queries plus E2E (no real-Postgres unit harness); the worker-side mapping
+has a unit test:
+
+- `build_discovered_derivation_carries_input_sources`
+  (`backend/gradient-worker/src/executor/eval.rs`) - a parsed `Derivation` with
+  two `inputSrcs` yields a `DiscoveredDerivation` carrying them, so they reach the
+  server for persistence and gating.

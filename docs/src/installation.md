@@ -5,7 +5,7 @@ Gradient is distributed as a NixOS module. The recommended way to install it is 
 ## Prerequisites
 
 - NixOS with flakes enabled
-- PostgreSQL (can be configured automatically)
+- PostgreSQL 18 or newer (can be configured automatically); the server refuses to start against older versions
 - An NGINX reverse proxy (can be configured automatically)
 
 ## Adding Gradient to Your Flake
@@ -62,6 +62,36 @@ The server does **not** start a worker automatically. Add a co-located worker to
 
 All available options are searchable at the [Options Search](https://wavelens.github.io/gradient-search).
 
+## TLS configuration
+
+Two independent settings control TLS, and conflating them is a common source of
+broken logins:
+
+- `services.gradient.useTls` (default `true`) controls how Gradient itself
+  behaves: it emits `https://` URLs (the OIDC redirect URL, `GRADIENT_SERVE_URL`)
+  and marks session cookies `Secure`. Set it to `false` **only** for a genuinely
+  plaintext-HTTP deployment - turning it off so that nginx stops managing
+  certificates will also stop your browser from sending the secure session
+  cookie, breaking login.
+- `services.gradient.reverseProxy.nginx.manageTls` (default `true`) controls
+  whether nginx obtains and serves the certificate itself (it sets the vhost's
+  `enableACME` and `forceSSL`). It has no effect when `useTls = false`.
+
+If TLS is terminated by an upstream proxy (Traefik, Cloudflare, a load balancer)
+that forwards plain HTTP to nginx, keep `useTls = true` so Gradient still emits
+`https://` URLs and secure cookies, and set `manageTls = false` so nginx doesn't
+also try to obtain a certificate:
+
+```nix
+{
+  services.gradient = {
+    useTls = true;                          # emit https URLs + secure cookies
+    reverseProxy.nginx.enable = true;       # still let nginx serve static files
+    reverseProxy.nginx.manageTls = false;   # upstream proxy terminates TLS
+  };
+}
+```
+
 ## Binary Cache (Optional)
 
 Add the public cache to avoid rebuilding Gradient from source:
@@ -69,9 +99,9 @@ Add the public cache to avoid rebuilding Gradient from source:
 ```nix
 {
   nix.settings = {
-    substituters     = [ "https://gradient.wavelens.io/cache/main" ];
+    substituters     = [ "https://public.gradient.ci/cache/main" ];
     trusted-public-keys = [
-      "gradient.wavelens.io-main:qmxRE+saUvhNa3jqaCMWje+feVU77TjABchZrPGf7A8="
+      "public.gradient.ci-main:qmxRE+saUvhNa3jqaCMWje+feVU77TjABchZrPGf7A8="
     ];
   };
 }

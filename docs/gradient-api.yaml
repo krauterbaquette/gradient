@@ -99,6 +99,8 @@ servers:
 tags:
   - name: general
     description: Health check and server configuration
+  - name: board
+    description: Job Board - metric queries, live dispatched jobs, workers, scoring, and expensive builds
   - name: auth
     description: Authentication - login, register, OAuth/OIDC
   - name: user
@@ -129,6 +131,8 @@ tags:
     description: Per-organization named forge integrations (inbound HMAC secrets + outbound API credentials)
   - name: admin
     description: Server-wide administrative endpoints. All routes require the caller to have the `superuser` flag.
+  - name: scim
+    description: SCIM 2.0 instance-level provisioning (Users + Groups), bearer-token authenticated, mounted at `/scim/v2` only when SCIM is enabled.
 
 security:
   - bearerAuth: []
@@ -454,9 +458,9 @@ paths:
       tags: [auth]
       summary: OIDC login redirect
       description: |-
-        Redirects the browser to the OIDC provider's authorization endpoint (HTTP 302) and
-        sets a short-lived `oidc_csrf` cookie carrying the signed `state` and `nonce` values
-        that must be returned on the callback.
+        Redirects the browser to the OIDC provider's authorization endpoint (HTTP 302) using
+        PKCE (S256), and sets a short-lived `oidc_csrf` cookie carrying the signed `state`,
+        `nonce`, and PKCE verifier that must be returned on the callback.
       security: []
       operationId: oidcLogin
       responses:
@@ -739,6 +743,9 @@ paths:
         Creates a new API key. The full key (prefixed with `GRAD`) is returned once -
         it cannot be retrieved again. Use it as `Authorization: Bearer GRAD<key>`.
         Pass `expires_in_days` to make the key auto-expire; omit for no expiry.
+        A cache-pinned key may only grant cache permissions the caller already
+        holds; members of an organization subscribed to the cache are treated as
+        read-only, so they can mint read-only cache keys.
       operationId: createUserKey
       requestBody:
         required: true
@@ -1773,6 +1780,14 @@ paths:
         - {}
         - cookieAuth: []
         - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Max evaluations to return, newest first. Defaults to the project's keep_evaluations.
+          schema:
+            type: integer
+            minimum: 1
       responses:
         '200':
           description: List of evaluation summaries
@@ -2129,7 +2144,11 @@ paths:
       tags: [actions]
       summary: Fire action now (synthetic test)
       operationId: testProjectAction
-      description: Fires the action immediately with a synthetic test event, bypassing event matching.
+      description: >-
+        Fires the action immediately with a synthetic test event, bypassing event matching.
+        Forge-integration actions (`forge_status_report`, `open_pr`) instead run a non-mutating
+        connectivity check against the project's repository, since a synthetic status/PR posted
+        against a placeholder commit is always rejected by the forge.
       responses:
         '200':
           description: Action fired
@@ -2877,17 +2896,15 @@ paths:
       summary: List evaluation builds
       description: |-
         Returns `.drv` builds associated with the evaluation, sorted by status
-        (Building → Queued → Failed → Aborted/DependencyFailed → Completed/Substituted),
+        (Building → Queued → FailedTransient/FailedPermanent/FailedTimeout → Aborted/DependencyFailed → Completed/Substituted),
         then by display name. Supports optional `limit` and `offset` query parameters
         for pagination.
 
-        Follower builds - those with a non-null `via` pointing at a leader build
-        in another evaluation that's doing the actual work - are returned as the
-        **leader's row**, not the follower's stand-in. The frontend should treat
-        each item's `id` as the canonical build id (used for log, downloads, and
-        dependency graph endpoints); for follower placements that id will resolve
-        to the leader's evaluation. The leader is always in the same organization
-        as the evaluation being queried.
+        Each item is a per-evaluation `build_job`; its `id` is used for log,
+        downloads, and dependency-graph endpoints. The build *state* (status,
+        timing, log) comes from the global `derivation_build` anchor shared by
+        every evaluation that needs the same derivation, so a derivation is
+        built once and the outcome is reused across evaluations and organizations.
       operationId: listEvaluationBuilds
       parameters:
         - name: limit
@@ -3011,6 +3028,90 @@ paths:
                     properties:
                       message:
                         $ref: '#/components/schemas/ArtefactTree'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /evals/{evaluation}/closure:
+    parameters:
+      - $ref: '#/components/parameters/EvaluationId'
+    get:
+      tags: [evals]
+      summary: Get closure size graph for an evaluation
+      description: |-
+        Returns the union dependency closure of all the evaluation's entry-point
+        builds with per-node uncompressed NAR sizes and an exact `total_size_bytes`.
+        Same shape as `/builds/{build}/closure`.
+      operationId: getEvalClosure
+      responses:
+        '200':
+          description: Closure size graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/ClosureGraph'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /evals/{evaluation}/flake-graph:
+    parameters:
+      - $ref: '#/components/parameters/EvaluationId'
+    get:
+      tags: [evals]
+      summary: Get the walked flake output graph for an evaluation
+      description: |-
+        Returns the flake output nodes walked during evaluation, each with its
+        attribute path, parent, name, kind, and (for derivations) the `.drv` path.
+      operationId: getEvalFlakeGraph
+      responses:
+        '200':
+          description: Flake output graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/FlakeGraphNode'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /evals/{evaluation}/runtime-closure:
+    parameters:
+      - $ref: '#/components/parameters/EvaluationId'
+    get:
+      tags: [evals]
+      summary: Get runtime closure size graph for an evaluation
+      description: |-
+        Union runtime reference closure of all the evaluation's entry-point build
+        outputs. Runtime counterpart of `/evals/{evaluation}/closure`.
+      operationId: getEvalRuntimeClosure
+      responses:
+        '200':
+          description: Runtime closure size graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/ClosureGraph'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -3168,6 +3269,64 @@ paths:
         '410':
           description: Session expired.
 
+  /build-requests/source:
+    post:
+      tags: [build-requests]
+      summary: Upload a pre-packed source NAR and queue an evaluation
+      description: |-
+        One-shot alternative to the manifest/blob flow for clients built with
+        the `nix` feature. The client NAR-packs the git-tracked source itself
+        and uploads it here; the server computes the `/nix/store/<hash>-source`
+        path, signs it, lazily creates the per-org `build-request` project, and
+        queues an evaluation. Bounded by the same per-request size limit as blob
+        upload.
+      operationId: postBuildRequestSource
+      parameters:
+        - name: organization
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Organization name.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [nar]
+              properties:
+                nar:
+                  type: string
+                  format: binary
+                  description: The packed source NAR.
+                target:
+                  type: string
+                  description: Eval target attribute path (defaults to the project wildcard).
+                system:
+                  type: string
+                  description: Target system.
+      responses:
+        '200':
+          description: Evaluation queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/DispatchResponse'
+        '400':
+          description: Missing or empty `nar` field.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   # ── Builds ───────────────────────────────────────────────────────────────────
 
   /builds/{build}:
@@ -3179,7 +3338,7 @@ paths:
       description: |-
         Returns full build details including status, derivation path, architecture, assigned server, and output store paths.
 
-        **Access:** Accessible to members of the build's organization. Additionally, when this build is the leader of a follower build in a cache-connected organization, members of that follower organization are granted read access. See `docs/src/scheduler.md#cross-cache-deduplication`.
+        **Access:** Accessible to members of any organization whose evaluation references this derivation (the build-once anchor is shared across organizations via cache reachability). See `docs/src/scheduler.md#shared-build-anchors`.
       operationId: getBuild
       responses:
         '200':
@@ -3207,7 +3366,11 @@ paths:
       description: |-
         Returns the complete build log as a single string. Empty string if no log is available yet.
 
-        **Access:** Accessible to members of the build's organization. Additionally, when this build is the leader of a follower build in a cache-connected organization, members of that follower organization are granted read access. See `docs/src/scheduler.md#cross-cache-deduplication`.
+        A `Substituted` build (its outputs came from a cache) has no log of its
+        own, so the log of the most recent prior build of the same derivation is
+        returned instead. The chunk/lines endpoints fall back the same way.
+
+        **Access:** Accessible to members of any organization whose evaluation references this derivation (the build-once anchor is shared across organizations via cache reachability). See `docs/src/scheduler.md#shared-build-anchors`.
       operationId: getBuildLog
       responses:
         '200':
@@ -3240,6 +3403,154 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /builds/{build}/log/chunks:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+    get:
+      tags: [builds]
+      summary: Get build log chunk index
+      description: |-
+        Returns the index of the zstd-compressed log chunks written when the build
+        finalized: total chunk/line/byte counts and per-chunk line/byte offsets.
+        `total_chunks` is `0` for builds whose log has not been finalized yet (use the
+        streaming `POST /log` endpoint for in-progress builds).
+
+        **Access:** Same as `GET /builds/{build}/log`.
+      operationId: getBuildLogChunks
+      responses:
+        '200':
+          description: Chunk index
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/LogChunkIndex'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /builds/{build}/log/chunk/{index}:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+      - name: index
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int32
+        description: Zero-based chunk index from the chunk index response.
+    get:
+      tags: [builds]
+      summary: Get a single decompressed log chunk
+      description: |-
+        Returns one chunk's plaintext (server-decompressed) with the active ANSI
+        color state at the chunk boundary already prepended, so the chunk renders
+        correctly standalone.
+
+        **Access:** Same as `GET /builds/{build}/log`.
+      operationId: getBuildLogChunk
+      responses:
+        '200':
+          description: Chunk plaintext
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /builds/{build}/log/lines:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+      - name: start
+        in: query
+        schema:
+          type: integer
+          format: int64
+        description: 1-based first line (inclusive). Defaults to 1.
+      - name: end
+        in: query
+        schema:
+          type: integer
+          format: int64
+        description: 1-based last line (inclusive). Defaults to the last line.
+      - name: range
+        in: query
+        schema:
+          type: string
+        description: Alternative to start/end, e.g. `L1234-L1243` (the `L` is optional).
+    get:
+      tags: [builds]
+      summary: Get a build log line range
+      description: |-
+        Returns the plaintext for an inclusive 1-based logical line range, resolving
+        the covering chunk(s) server-side and prepending the correct color prefix for
+        the first line. Hand- and CLI-friendly; the frontend also uses this as its
+        lazy fetch path.
+
+        **Access:** Same as `GET /builds/{build}/log`.
+      operationId: getBuildLogLines
+      responses:
+        '200':
+          description: Line range plaintext
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /builds/{build}/log/search:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+      - name: q
+        in: query
+        required: true
+        schema:
+          type: string
+        description: Substring to search for.
+      - name: case
+        in: query
+        schema:
+          type: boolean
+          default: false
+        description: Case-sensitive match when true.
+    get:
+      tags: [builds]
+      summary: Search a build log
+      description: |-
+        Streams NDJSON search hits in scan order as the server decompresses chunks,
+        so first matches and a running count appear immediately. Each line is a
+        `LogSearchHit`; the final frame is a `LogSearchDone` carrying `total_matches`.
+        Matches are per-line substrings (no multi-line matches).
+
+        **Access:** Same as `GET /builds/{build}/log`.
+      operationId: searchBuildLog
+      responses:
+        '200':
+          description: NDJSON stream of search hits, terminated by a done frame
+          content:
+            application/x-ndjson:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/LogSearchHit'
+                  - $ref: '#/components/schemas/LogSearchDone'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /builds/{build}/graph:
     parameters:
       - $ref: '#/components/parameters/BuildId'
@@ -3251,7 +3562,7 @@ paths:
         capped at 500 nodes. Each edge `source → target` means `source` must be built
         before `target`.
 
-        **Access:** Accessible to members of the build's organization. Additionally, when this build is the leader of a follower build in a cache-connected organization, members of that follower organization are granted read access. See `docs/src/scheduler.md#cross-cache-deduplication`.
+        **Access:** Accessible to members of any organization whose evaluation references this derivation (the build-once anchor is shared across organizations via cache reachability). See `docs/src/scheduler.md#shared-build-anchors`.
       operationId: getBuildGraph
       responses:
         '200':
@@ -3265,6 +3576,67 @@ paths:
                     properties:
                       message:
                         $ref: '#/components/schemas/BuildGraph'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /builds/{build}/closure:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+    get:
+      tags: [builds]
+      summary: Get closure size graph
+      description: |-
+        Returns the full dependency closure of the build's derivation with per-node
+        uncompressed NAR sizes and an exact `total_size_bytes` over the whole closure.
+        The `nodes`/`edges` lists are capped (largest nodes first) with `truncated`
+        set when the cap is hit; `total_size_bytes` stays exact regardless. Intended
+        for the closure Sankey view and size-trimming tooling.
+
+        **Access:** Same as the dependency graph endpoint.
+      operationId: getBuildClosure
+      responses:
+        '200':
+          description: Closure size graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/ClosureGraph'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /builds/{build}/runtime-closure:
+    parameters:
+      - $ref: '#/components/parameters/BuildId'
+    get:
+      tags: [builds]
+      summary: Get runtime closure size graph
+      description: |-
+        Like `/builds/{build}/closure` but walks runtime store-path references
+        (narinfo `References:`) from the build's outputs instead of build-time
+        dependencies. Only as complete as the cached outputs; node ids are
+        store-path hashes. Same `ClosureGraph` shape.
+      operationId: getBuildRuntimeClosure
+      responses:
+        '200':
+          description: Runtime closure size graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/ClosureGraph'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -3310,7 +3682,7 @@ paths:
 
         Accessible without authentication when the owning organisation is public.
 
-        **Access:** Accessible to members of the build's organization. Additionally, when this build is the leader of a follower build in a cache-connected organization, members of that follower organization are granted read access. See `docs/src/scheduler.md#cross-cache-deduplication`.
+        **Access:** Accessible to members of any organization whose evaluation references this derivation (the build-once anchor is shared across organizations via cache reachability). See `docs/src/scheduler.md#shared-build-anchors`.
       operationId: getBuildDownloads
       responses:
         '200':
@@ -3463,9 +3835,12 @@ paths:
       summary: List registered workers for an organization
       description: |
         Returns all workers registered under this organization (peer), merged with
-        live status from the scheduler for currently connected workers.
+        live status from the scheduler for currently connected workers, plus the
+        server-level base workers (`is_base: true`) the org can opt into.
         Live fields (`architectures`, `system_features`, etc.) are only populated
-        for build-capable workers that have sent `WorkerCapabilities`.
+        for build-capable workers that have sent `WorkerCapabilities`. A base
+        worker is omitted when the org already has a normal registration with the
+        same `worker_id` - that registration shadows it.
       operationId: listOrgWorkers
       security:
         - bearerAuth: []
@@ -3625,6 +4000,9 @@ paths:
       description: |
         Removes the worker registration. The worker may still be connected until
         it disconnects naturally - it will not be able to reconnect after that.
+        The org's own registration is removed first, so a normal worker is deleted
+        even when a base worker shares its `worker_id`; `409` is only returned when
+        the id resolves solely to a base worker (managed via server state).
       operationId: deleteOrgWorker
       security:
         - bearerAuth: []
@@ -3640,6 +4018,49 @@ paths:
                     properties:
                       message:
                         type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The id resolves only to a base worker, which is managed via server state.
+
+  /orgs/{organization}/workers/{worker_id}/test:
+    post:
+      tags: [workers]
+      summary: Test worker connectivity and authorization
+      description: |
+        Checks whether the worker is currently connected and whether it has
+        successfully authorized for the given organization. Useful for
+        verifying base-worker setup without waiting for a real job.
+      operationId: testOrgWorker
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: organization
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Organization name
+        - name: worker_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Worker ID to test
+      responses:
+        '200':
+          description: Test result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        $ref: '#/components/schemas/WorkerTestResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -3674,6 +4095,77 @@ paths:
                         type: array
                         items:
                           $ref: '#/components/schemas/WorkerInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/state:
+    get:
+      tags: [admin]
+      summary: Export the live state configuration
+      description: |
+        Reconstructs the current users, organizations, projects, caches,
+        custom roles, API keys, workers (including server-level base workers
+        with their pre-enabled organizations) and integrations into a
+        declarative `services.gradient.state` shape, so operators can codify
+        the running system back into their nix configuration.
+
+        Every credential-file field (`password_file`, `private_key_file`,
+        `signing_key_file`, `token_file`, `key_file`, `secret_file`,
+        `access_token_file`) is redacted to `null` - the hashed/encrypted
+        secrets cannot be recovered and must be filled in by hand. GitHub
+        integration rows are exported with their `installation_id` /
+        `account_login`. The auto-managed `build-request` project and the
+        built-in `Admin`/`Write`/`View` roles are omitted.
+
+        Requires `superuser`.
+      operationId: exportState
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: format
+          in: query
+          required: false
+          description: |
+            `nix` (default) returns a ready-to-paste Nix expression as
+            `text/plain`; `json` returns the `StateConfiguration` object in the
+            standard response envelope.
+          schema:
+            type: string
+            enum: [nix, json]
+            default: nix
+      responses:
+        '200':
+          description: Exported state configuration
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # Generated by `GET /admin/state`. Secret `*_file` fields are null and
+                # must be filled in with the credential paths on your host.
+                {
+                  organizations = {
+                    myorg = {
+                      name = "myorg";
+                      id = "018f6f3a-0000-7000-8000-000000000001";
+                      private_key_file = null;
+                      created_by = "operator";
+                    };
+                  };
+                }
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: object
+                        description: Declarative state, mirroring `services.gradient.state`.
+        '400':
+          description: Unknown `format` value.
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -3722,6 +4214,55 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           description: A deep_gc task is already active.
+
+  /admin/draining:
+    post:
+      tags: [admin]
+      summary: Toggle instance draining
+      description: |
+        Enables or disables draining for the instance. While draining, the
+        scheduler stops dispatching queued evaluations and builds, and every
+        in-flight evaluation is parked (`Waiting`, reason `draining`) so the
+        server can be stopped safely. Disabling recovers the parked evaluations
+        back to `Queued`.
+
+        Draining is in-memory only, so it always clears on the next server
+        startup (parked evaluations are recovered automatically).
+
+        Requires `superuser`.
+      operationId: setDraining
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Draining state applied
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: object
+                        required: [draining]
+                        properties:
+                          draining:
+                            type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /admin/tasks:
     get:
@@ -4047,6 +4588,11 @@ paths:
     get:
       tags: [caches]
       summary: Get cache
+      description: >-
+        Returns cache details. Public caches are visible to anyone. A private
+        cache is visible to its cache members and to members of any organization
+        subscribed to it (matching the visibility of `GET /caches`); other
+        callers receive `404`.
       operationId: getCache
       responses:
         '200':
@@ -4195,7 +4741,7 @@ paths:
         Returns the Nix-format secret signing key string for the cache, e.g.:
         `gradient.example.com-mycache:AAAA...` (base64-encoded 64-byte ed25519 keypair)
 
-        Requires `manageCacheKeys`. Keep the secret key private — do not add it to `nix.conf`.
+        Requires `manageCacheKeys`. Keep the secret key private - do not add it to `nix.conf`.
         To configure Nix clients use the public key from `GET /caches/{cache}/public-key` instead.
       operationId: getCacheKey
       responses:
@@ -4247,7 +4793,11 @@ paths:
     get:
       tags: [caches]
       summary: Get cache statistics
-      description: Returns bandwidth and hit statistics for the cache.
+      description: >-
+        Returns bandwidth and hit statistics for the cache. Visible to anyone
+        for public caches, and to cache members or members of any organization
+        subscribed to a private cache (matching `GET /caches/{cache}`); other
+        callers receive `404`.
       operationId: getCacheStats
       responses:
         '200':
@@ -4336,6 +4886,184 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+    post:
+      tags: [caches]
+      summary: Upload a NAR to a cache
+      description: |-
+        Uploads a single NAR (its bytes plus narinfo metadata) to this cache.
+        Requires `writeStore`. The server validates the byte length against the
+        declared `file_size`, stores the blob, records the cached path, and
+        enqueues a signature for this cache. Re-uploading an existing store path
+        reuses the cached path and only adds this cache's signature.
+
+        The route's body limit is `GRADIENT_MAX_NAR_UPLOAD_SIZE` (default 512 MiB).
+        The bundled reverse proxy additionally caps each request body at 100 MiB,
+        so NARs above that must use the chunked endpoints
+        (`PUT .../nars/{hash}/chunk` + `POST .../nars/{hash}/finalize`).
+      operationId: uploadCacheNar
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [narinfo, nar]
+              properties:
+                narinfo:
+                  type: string
+                  description: |-
+                    JSON object: `store_path`, `file_hash`, `file_size`,
+                    `nar_size`, `nar_hash`, `references` (array), optional `deriver`.
+                nar:
+                  type: string
+                  format: binary
+                  description: Raw NAR bytes.
+      responses:
+        '201':
+          description: NAR stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: object
+                        properties:
+                          store_path:
+                            type: string
+                          created:
+                            type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /caches/{cache}/nars/{hash}/chunk:
+    parameters:
+      - $ref: '#/components/parameters/CacheSlug'
+      - name: hash
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Store-path base name (`<hash>-<name>`) being uploaded.
+    put:
+      tags: [caches]
+      summary: Append a chunk of a NAR being uploaded
+      description: |-
+        Appends one slice of a NAR to a server-side `.partial` staging file,
+        keyed by `(cache, hash)`. Used to upload NARs larger than the reverse
+        proxy's per-request body limit by splitting them across several requests.
+        Requires `writeStore`. `offset == 0` starts fresh (truncating any stale
+        partial); otherwise the chunk is appended only when `offset` equals the
+        bytes already staged. The response's `received` is authoritative: the
+        client sets its next offset to it (resending if it did not advance) and
+        calls `POST .../finalize` once `received` equals the NAR size.
+      operationId: uploadCacheNarChunk
+      parameters:
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Byte offset this chunk starts at; must equal bytes already staged.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Raw NAR slice (≤ the proxy body limit).
+      responses:
+        '200':
+          description: Chunk staged
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: object
+                        properties:
+                          received:
+                            type: integer
+                            format: int64
+                            description: Authoritative bytes staged; the client's next offset.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          description: Chunk would push the NAR past `GRADIENT_MAX_NAR_UPLOAD_SIZE`.
+
+  /caches/{cache}/nars/{hash}/finalize:
+    parameters:
+      - $ref: '#/components/parameters/CacheSlug'
+      - name: hash
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Store-path base name (`<hash>-<name>`) being finalized.
+    post:
+      tags: [caches]
+      summary: Finalize a chunked NAR upload
+      description: |-
+        Validates the fully staged NAR against its narinfo (the staged byte
+        length must equal `file_size`), ingests it exactly like the single-shot
+        upload, and drops the `.partial`. Requires `writeStore`.
+      operationId: finalizeCacheNarUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [store_path, file_hash, file_size, nar_size, nar_hash]
+              properties:
+                store_path: { type: string }
+                file_hash: { type: string }
+                file_size: { type: integer, format: int64 }
+                nar_size: { type: integer, format: int64 }
+                nar_hash: { type: string }
+                references:
+                  type: array
+                  items: { type: string }
+                deriver: { type: string, nullable: true }
+      responses:
+        '201':
+          description: NAR stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: object
+                        properties:
+                          store_path:
+                            type: string
+                          created:
+                            type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /caches/{cache}/nars/stats:
     parameters:
@@ -4444,7 +5172,7 @@ paths:
         `cached_path` row is removed in the same transaction, any matching
         `derivation_output.is_cached` rows are flipped to `false`, and the NAR
         blob is garbage-collected asynchronously after the response. Requires
-        `writeStore`. Allowed on state-managed caches — NAR content is operational
+        `writeStore`. Allowed on state-managed caches - NAR content is operational
         data, distinct from cache configuration.
       operationId: deleteCacheNar
       security:
@@ -4927,9 +5655,12 @@ paths:
         URL (`/hooks/gitea/...`, `/hooks/forgejo/...`, `/hooks/gitlab/...`).
         The stored `forge_type` is display metadata only for inbound.
 
-        `forge_type: "github"` is rejected with `400`: GitHub integration is
-        provided by the server-wide GitHub App together with the org's
-        `github_installation_id`, not by per-org integration rows.
+        `forge_type: "github"` integrations are creatable by supplying
+        `installation_id`. The server App must be configured (else `400`);
+        the installation id is validated against the App (invalid id returns
+        `400`). An inbound and outbound integration pair is created
+        automatically, named `github-<account>`. Multiple installations per org
+        are supported (one per GitHub account).
       operationId: createOrgIntegration
       requestBody:
         required: true
@@ -5034,9 +5765,8 @@ paths:
         Patch-updates an integration. Omit a field to leave it unchanged.
         Pass an empty string for `secret` or `access_token` to **clear** it.
 
-        `forge_type=github` rows are server-managed (auto-seeded when the
-        GitHub App is installed on the org) and cannot be modified - PATCH
-        rejects them with `400`.
+        `forge_type=github` rows are managed by the App and installation; PATCH
+        rejects them with `400`. Delete the row to remove the integration.
       operationId: patchOrgIntegration
       requestBody:
         required: true
@@ -5070,8 +5800,8 @@ paths:
       description: >-
         Deletes an integration. Any project `project_integration` rows
         referencing it are cleared via `ON DELETE SET NULL`.
-        `forge_type=github` rows are server-managed and cannot be deleted -
-        the endpoint returns `400` for them.
+        `forge_type=github` rows can be deleted; deleting removes the
+        installation binding for that account.
       operationId: deleteOrgIntegration
       responses:
         '200':
@@ -5099,7 +5829,13 @@ paths:
         `GRADIENT_GITHUB_APP_WEBHOOK_SECRET_FILE`.
 
         **Handled events:**
-        - `push` - triggers an evaluation on any project whose repository URL matches.
+        - `push` / `pull_request` / `release` - trigger an evaluation on any project whose
+          repository URL matches the matching trigger. A `push` carrying an
+          all-zero `after` SHA (a branch/tag deletion or a forge "test" delivery)
+          is accepted as a `200` no-op rather than rejected.
+        - `check_run` - the "Approve and Run" action clears a fork-PR approval gate.
+        - `issue_comment` - `/gradient run` / `/gradient approve` maintainer commands.
+        - `pull_request_review` - a maintainer's approving review clears a fork-PR approval gate.
         - `installation` / `installation_repositories` - stores or clears the GitHub App
           `installation_id` on the matching Gradient organization.
         - `ping` - always returns 200.
@@ -5139,7 +5875,7 @@ paths:
                       message:
                         $ref: '#/components/schemas/WebhookResponse'
         '400':
-          description: Malformed payload or unsupported forge
+          description: Unparseable JSON payload or unsupported forge
         '401':
           description: Invalid webhook signature
         '404':
@@ -5189,6 +5925,9 @@ paths:
         `project_integration.inbound_integration` points at this row and whose
         repository URL matches the webhook payload's clone URL.
 
+        A push carrying an all-zero `after` SHA (a branch/tag deletion or a
+        forge "test" delivery) is accepted as a `200` no-op rather than rejected.
+
         This endpoint is unauthenticated (verified via forge-specific signature).
       operationId: forgeWebhook
       requestBody:
@@ -5211,7 +5950,7 @@ paths:
                       message:
                         $ref: '#/components/schemas/WebhookResponse'
         '400':
-          description: Malformed payload or unsupported forge
+          description: Unparseable JSON payload or unsupported forge
         '401':
           description: Invalid webhook signature
         '404':
@@ -5223,35 +5962,743 @@ paths:
   # These endpoints live outside /api/v1. The server URL for these is the root,
   # e.g. https://gradient.example.com (no /api/v1 prefix).
 
-x-nix-cache-paths:
-  description: |-
-    The following Nix binary cache endpoints are served at the root of the server
-    (not under `/api/v1`). They implement the Nix binary cache protocol and are
-    used by `nix-store --realise`, `nixos-rebuild`, and other Nix clients.
-    Private caches require HTTP Basic Auth (any username, JWT or API key as password).
+  x-nix-cache-paths:
+    description: |-
+      The following Nix binary cache endpoints are served at the root of the server
+      (not under `/api/v1`). They implement the Nix binary cache protocol and are
+      used by `nix-store --realise`, `nixos-rebuild`, and other Nix clients.
+      Private caches require HTTP Basic Auth (any username, JWT or API key as password).
 
-    ### Substituter surface
+      ### Substituter surface
 
-    | Endpoint | Description |
-    |---|---|
-    | `GET /cache/{cache}/nix-cache-info` | Cache metadata for Nix. Add `?json` for JSON response (`NixCacheInfo`). |
-    | `GET /cache/{cache}/gradient-cache-info` | Gradient-specific cache metadata. Add `?json` for JSON response (`GradientCacheInfo`). Responds with `Access-Control-Allow-Origin: *` for browser probes. |
-    | `GET /cache/{cache}/{hash}.narinfo` | Path info for a store path. Add `?json` for JSON response (`NixPathInfo`). |
-    | `GET /cache/{cache}/nar/{hash}.nar.zst` | Compressed NAR archive |
+      | Endpoint | Description |
+      |---|---|
+      | `GET /cache/{cache}/nix-cache-info` | Cache metadata for Nix. Add `?json` for JSON response (`NixCacheInfo`). |
+      | `GET /cache/{cache}/gradient-cache-info` | Gradient-specific cache metadata. Add `?json` for JSON response (`GradientCacheInfo`). Responds with `Access-Control-Allow-Origin: *` for browser probes. |
+      | `GET /cache/{cache}/{hash}.narinfo` | Path info for a store path. Add `?json` for JSON response (`NixPathInfo`). |
+      | `GET /cache/{cache}/nar/{hash}.nar.zst` | Compressed NAR archive |
 
-    ### Gradient Proto surface
+      ### Gradient Proto surface
 
-    | Endpoint | Description |
-    |---|---|
-    | `GET /cache/{cache}/proto` | WebSocket upgrade carrying rkyv-encoded binary frames (same wire format as `/proto`). Read-only, cache-scoped. PUBLIC caches allow anonymous connections (governed by `GRADIENT_PROTO_ALLOW_ANONYMOUS_CACHE`, default `true`); PRIVATE caches require `Authorization: GRAD<key>`. Anonymous sessions are subject to per-IP connection and rate caps (`GRADIENT_PROTO_ANON_MAX_CONNECTIONS_PER_IP`, `GRADIENT_PROTO_ANON_RATE_PER_SECOND`, `GRADIENT_PROTO_ANON_RATE_BURST`). Only `CacheQuery` (Normal/Pull modes) and `NarRequest` messages are accepted; Push, job RPCs, and worker registration are rejected. |
+      | Endpoint | Description |
+      |---|---|
+      | `GET /cache/{cache}/proto` | WebSocket upgrade carrying rkyv-encoded binary frames (same wire format as `/proto`). Read-only, cache-scoped. PUBLIC caches allow anonymous connections (governed by `GRADIENT_PROTO_ALLOW_ANONYMOUS_CACHE`, default `true`); PRIVATE caches require `Authorization: GRAD<key>`. Anonymous sessions are subject to per-IP connection and rate caps (`GRADIENT_PROTO_ANON_MAX_CONNECTIONS_PER_IP`, `GRADIENT_PROTO_ANON_RATE_PER_SECOND`, `GRADIENT_PROTO_ANON_RATE_BURST`). Only `CacheQuery` (Normal/Pull modes) and `NarRequest` messages are accepted; Push, job RPCs, and worker registration are rejected. |
 
-    ### Inspection surface
+      ### Inspection surface
 
-    | Endpoint | Description |
-    |---|---|
-    | `GET /cache/{cache}/ls/{hash}` | JSON tree listing of the NAR (nix-serve `.ls` v1 schema). Rate-limited at 60 req/min. |
-    | `GET /cache/{cache}/serve/{hash}/{path}` | Extract a single file (bytes, Content-Type sniffed) or directory (tar.zst) from a NAR. Rate-limited at 60 req/min. |
-    | `GET /cache/{cache}/log/{drv}` | Build log for `<drv>.drv`, from either locally-built or upstream-substituted builds (substituter compat - `nix log`). Rate-limited at ~300 req/min. |
+      | Endpoint | Description |
+      |---|---|
+      | `GET /cache/{cache}/ls/{hash}` | JSON tree listing of the NAR (nix-serve `.ls` v1 schema). Rate-limited at 60 req/min. |
+      | `GET /cache/{cache}/serve/{hash}/{path}` | Extract a single file (bytes, Content-Type sniffed) or directory (tar.zst) from a NAR. Rate-limited at 60 req/min. |
+      | `GET /cache/{cache}/log/{drv}` | Build log for `<drv>.drv`, from either locally-built or upstream-substituted builds (substituter compat - `nix log`). Rate-limited at ~300 req/min. |
+
+  /metrics/catalog:
+    get:
+      tags: [board]
+      summary: Metric catalog
+      description: Lists the queryable metrics with their kind, unit, and dimensions.
+      operationId: getMetricsCatalog
+      responses:
+        '200':
+          description: Catalog of available metrics
+
+  /metrics/query:
+    get:
+      tags: [board]
+      summary: Query a metric time-series
+      description: |-
+        Returns time-bucketed points for a metric from `metric_rollup`, masked to
+        the caller's scope (superuser = all orgs, member = own + public orgs,
+        anonymous = public orgs). Unknown metrics or out-of-scope orgs return 404.
+      operationId: getMetricsQuery
+      parameters:
+        - { name: metric, in: query, required: true, schema: { type: string } }
+        - { name: granularity, in: query, schema: { type: string, enum: [minute, hour, day, week] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: org, in: query, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Time-series points
+        '404':
+          description: Unknown metric or org out of scope
+
+  /metrics/projects/{organization}/{project}/evaluations:
+    get:
+      tags: [board]
+      summary: Per-evaluation project metrics
+      description: Per-evaluation series (build time, eval time, output/closure sizes, dependencies) for the project's recent completed evaluations.
+      operationId: getProjectEvaluationMetrics
+      parameters:
+        - { name: organization, in: path, required: true, schema: { type: string } }
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Per-evaluation metric points
+
+  /metrics/projects/{organization}/{project}/entry-point:
+    get:
+      tags: [board]
+      summary: Per-evaluation entry-point metrics
+      description: Per-evaluation build metrics for a single entry point identified by its `eval` attribute path.
+      operationId: getEntryPointEvaluationMetrics
+      parameters:
+        - { name: organization, in: path, required: true, schema: { type: string } }
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: eval, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Per-evaluation entry-point metric points
+
+  /board/jobs/dispatched:
+    get:
+      tags: [board]
+      summary: Live dispatched jobs
+      description: In-flight dispatched jobs visible to the caller; out-of-scope jobs collapse to an aggregate `other_running` count.
+      operationId: getBoardDispatchedJobs
+      responses:
+        '200':
+          description: Dispatched jobs plus other_running count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DispatchedJobSummary'
+                  other_running:
+                    type: integer
+
+  /board/jobs/decisions:
+    get:
+      tags: [board]
+      summary: Recent dispatch decisions (all candidate scores)
+      description: >
+        Bounded ring of the most recent dispatch decisions, each with every
+        scored candidate including the rejected/negative ones the dispatcher
+        passed over. For tuning scoring rules. Superuser-only, as candidates
+        span all organizations.
+      operationId: getBoardDispatchDecisions
+      responses:
+        '200':
+          description: Recent dispatch decisions, most recent first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DispatchDecision'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller is not a superuser
+
+  /board/jobs/pending:
+    get:
+      tags: [board]
+      summary: Pending (undispatched) jobs
+      description: Queued jobs not yet dispatched to a worker, visible to the caller; out-of-scope jobs collapse to an aggregate `other_pending` count.
+      operationId: getBoardPendingJobs
+      responses:
+        '200':
+          description: Pending jobs plus other_pending count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PendingJobSummary'
+                  other_pending:
+                    type: integer
+
+  /board/jobs/expensive:
+    get:
+      tags: [board]
+      summary: Most expensive builds
+      description: Top builds by wall-clock build time, optionally excluding acknowledged (muted) derivations.
+      operationId: getBoardExpensiveJobs
+      parameters:
+        - { name: window_days, in: query, schema: { type: integer } }
+        - { name: exclude_acknowledged, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: Top builds by build time
+
+  /board/jobs/expensive-by-resource:
+    get:
+      tags: [board]
+      summary: Most expensive builds by resource
+      description: Top derivations by a captured per-build resource (peak RAM, CPU time, total disk bytes, or host network peak) from `derivation_metric`. Org-scoped.
+      operationId: getBoardExpensiveByResource
+      parameters:
+        - { name: metric, in: query, required: true, schema: { type: string, enum: [ram, cpu, disk, network] } }
+        - { name: window_days, in: query, schema: { type: integer } }
+        - { name: exclude_acknowledged, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: Top builds by resource
+        '404':
+          description: Unknown metric
+
+  /board/evals/expensive-by-resource:
+    get:
+      tags: [board]
+      summary: Most expensive evaluations by resource
+      description: Top evaluations by a captured per-eval resource (peak RSS/heap, thunks, fn calls, allocated bytes, or total eval time) from `evaluation_metric`. Org-scoped through the evaluation's project.
+      operationId: getBoardExpensiveEvalsByResource
+      parameters:
+        - { name: metric, in: query, required: true, schema: { type: string, enum: [rss, heap, thunks, fncalls, alloc, time] } }
+        - { name: window_days, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: Top evaluations by resource
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ExpensiveEval'
+        '404':
+          description: Unknown metric
+
+  /board/jobs/{id}:
+    get:
+      tags: [board]
+      summary: Dispatched job detail
+      description: Full dispatch record incl. per-rule scoring breakdown, job/worker/instance contexts. Runner-up candidates are superuser-only.
+      operationId: getBoardJob
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Job detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispatchedJobDetail' }
+        '404':
+          description: Not found or out of scope
+
+  /board/scoring/summary:
+    get:
+      tags: [board]
+      summary: Aggregate scoring summary
+      description: Score histogram and mean per-rule contribution over recently dispatched jobs, masked to the caller's orgs.
+      operationId: getBoardScoringSummary
+      parameters:
+        - { name: window_hours, in: query, required: false, schema: { type: integer, default: 24 } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 2000 } }
+      responses:
+        '200':
+          description: Scoring summary
+
+  /board/scoring/rules:
+    get:
+      tags: [board]
+      summary: Scoring rule catalog
+      description: Static name and human-readable description for every scheduler scoring rule, used by the board UI to explain rule names.
+      operationId: getBoardScoringRules
+      responses:
+        '200':
+          description: Rule catalog
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: array
+                        items:
+                          type: object
+                          required: [rule, description]
+                          properties:
+                            rule: { type: string }
+                            description: { type: string }
+
+  /board/workers:
+    get:
+      tags: [board]
+      summary: Connected workers
+      description: Connected workers with capability and live load; foreign-org worker identity and metrics are masked for non-superusers.
+      operationId: getBoardWorkers
+      responses:
+        '200':
+          description: Connected workers
+
+  /board/cache:
+    get:
+      tags: [board]
+      summary: Cache statistics
+      description: Cache totals plus hourly traffic and storage-growth series, aggregated across caches (anonymized infra view).
+      operationId: getBoardCache
+      parameters:
+        - { name: window_hours, in: query, required: false, schema: { type: integer, default: 24 } }
+      responses:
+        '200':
+          description: Cache statistics
+
+  /board/live:
+    get:
+      tags: [board]
+      summary: Job Board live events (WebSocket)
+      description: |-
+        Upgrades to a WebSocket streaming JSON board events (`queue_depth`,
+        `job_dispatched`, `worker_connected`, `worker_disconnected`). Per-org
+        events are masked to the caller's scope.
+      operationId: boardLive
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket upgrade successful
+
+  /board/cache/live:
+    get:
+      tags: [board]
+      summary: Cache change pings (WebSocket)
+      description: |-
+        Upgrades to a WebSocket emitting a content-free `{"type":"cache_changed"}`
+        ping whenever cache contents or stats change. Subscribers refetch their
+        own scope-filtered `GET /board/cache` view.
+      operationId: boardCacheLive
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket upgrade successful
+
+  /projects/{organization}/{project}/live:
+    get:
+      tags: [projects]
+      summary: Project live updates (WebSocket)
+      description: |-
+        Upgrades to a WebSocket emitting `evaluation_status_changed`,
+        `build_status_changed` and `evaluation_progress` events for this project,
+        so the project page refetches on change instead of polling.
+        `evaluation_progress` fires as builds and entry-points are persisted
+        during the evaluation phase, before any build changes status, so the
+        build/dependency totals grow live. Requires read access.
+      operationId: projectLive
+      parameters:
+        - { name: organization, in: path, required: true, schema: { type: string } }
+        - { name: project, in: path, required: true, schema: { type: string } }
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket upgrade successful
+
+  /evals/{evaluation}/live:
+    get:
+      tags: [evals]
+      summary: Evaluation live updates (WebSocket)
+      description: |-
+        Upgrades to a WebSocket emitting `evaluation_status_changed`,
+        `build_status_changed` and `evaluation_progress` events for this
+        evaluation. `evaluation_progress` fires as builds and entry-points are
+        persisted during the evaluation phase so the build list grows live.
+        Requires read access.
+      operationId: evaluationLive
+      parameters:
+        - { name: evaluation, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket upgrade successful
+
+  /builds/{build}/live:
+    get:
+      tags: [builds]
+      summary: Build live updates (WebSocket)
+      description: |-
+        Upgrades to a WebSocket emitting `build_status_changed` events for every
+        build in this build's evaluation (covers its dependency graph). Requires
+        read access.
+      operationId: buildLive
+      parameters:
+        - { name: build, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '101':
+          description: Switching Protocols - WebSocket upgrade successful
+
+  /board/network:
+    get:
+      tags: [board]
+      summary: Network & API statistics
+      description: NAR egress series, per-worker latest network/disk speeds (org-scoped), and per-route HTTP latency/throughput (superuser-only).
+      operationId: getBoardNetwork
+      parameters:
+        - { name: window_hours, in: query, required: false, schema: { type: integer, default: 24 } }
+      responses:
+        '200':
+          description: Network statistics
+
+  /board/fleet:
+    get:
+      tags: [board]
+      summary: Worker fleet time-series
+      description: Hourly connected / draining / by-capability worker counts derived from worker samples, scoped to the caller's orgs.
+      operationId: getBoardFleet
+      parameters:
+        - { name: window_hours, in: query, required: false, schema: { type: integer, default: 24 } }
+      responses:
+        '200':
+          description: Fleet time-series
+
+  /board/durations/heatmap:
+    get:
+      tags: [board]
+      summary: Build-duration heatmap
+      description: 2D build-duration distribution (duration band × hour) computed on demand from builds, scoped to the caller's orgs.
+      operationId: getBoardDurationsHeatmap
+      parameters:
+        - { name: window_hours, in: query, required: false, schema: { type: integer, default: 24 } }
+      responses:
+        '200':
+          description: Duration heatmap
+
+  /board/expensive/top-orgs:
+    get:
+      tags: [board]
+      summary: Top organizations by build time (superuser)
+      description: Organizations ranked by cumulative completed-build time in a window. Superuser only.
+      operationId: getBoardTopOrgs
+      parameters:
+        - { name: window_days, in: query, required: false, schema: { type: integer, default: 30 } }
+      responses:
+        '200':
+          description: Top organizations
+        '403':
+          description: Superuser required
+
+  /board/health:
+    get:
+      tags: [board]
+      summary: System health (superuser)
+      description: Process/runtime snapshot, pipeline rollup lag, HTTP route stats, and the instance `draining` flag. Superuser only.
+      operationId: getBoardHealth
+      responses:
+        '200':
+          description: System health
+        '403':
+          description: Superuser required
+
+  /board/acknowledged-derivations:
+    get:
+      tags: [board]
+      summary: List acknowledged (muted) derivations
+      operationId: listAcknowledgedDerivations
+      responses:
+        '200':
+          description: Acknowledged derivations
+        '403':
+          description: Superuser required
+    put:
+      tags: [board]
+      summary: Acknowledge (mute) a slow derivation
+      operationId: createAcknowledgedDerivation
+      responses:
+        '200':
+          description: Created acknowledgement id
+        '403':
+          description: Superuser required
+
+  /board/acknowledged-derivations/{id}:
+    delete:
+      tags: [board]
+      summary: Remove an acknowledged derivation
+      operationId: deleteAcknowledgedDerivation
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deleted
+        '403':
+          description: Superuser required
+
+  /orgs/{organization}/workers/{worker_id}/metrics:
+    get:
+      tags: [board]
+      summary: Per-worker metrics
+      description: Live-metric sample time-series (CPU, RAM, disk, network, load), connect/disconnect history, and total dispatched-job count for one worker. Org members only.
+      operationId: getOrgWorkerMetrics
+      parameters:
+        - { name: organization, in: path, required: true, schema: { type: string } }
+        - { name: worker_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Worker statistics
+        '404':
+          description: Organization or worker not found
+
+  # ── SCIM 2.0 ─────────────────────────────────────────────────────────────────
+  # Instance-level provisioning (RFC 7643/7644), mounted at /scim/v2 only when
+  # SCIM is enabled. All routes use the scimBearer token, not user auth.
+
+  /scim/v2/ServiceProviderConfig:
+    get:
+      tags: [scim]
+      summary: SCIM service provider configuration
+      description: Advertises supported SCIM features (patch, filter, no bulk/sort/etag/change-password).
+      operationId: scimServiceProviderConfig
+      security:
+        - scimBearer: []
+      responses:
+        '200':
+          description: Service provider configuration
+          content:
+            application/scim+json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+
+  /scim/v2/ResourceTypes:
+    get:
+      tags: [scim]
+      summary: SCIM resource types
+      description: Lists the supported resource types (User, Group).
+      operationId: scimResourceTypes
+      security:
+        - scimBearer: []
+      responses:
+        '200':
+          description: Resource types
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimListResponse'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+
+  /scim/v2/Schemas:
+    get:
+      tags: [scim]
+      summary: SCIM schemas
+      description: Lists the supported core schemas (User, Group).
+      operationId: scimSchemas
+      security:
+        - scimBearer: []
+      responses:
+        '200':
+          description: Schemas
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimListResponse'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+
+  /scim/v2/Users:
+    get:
+      tags: [scim]
+      summary: List / filter SCIM users
+      description: |-
+        Lists managed (SCIM-provisioned) users. Supports the `userName eq "..."`
+        and `externalId eq "..."` filter subset plus `startIndex`/`count` pagination.
+      operationId: scimListUsers
+      security:
+        - scimBearer: []
+      parameters:
+        - { name: filter, in: query, required: false, schema: { type: string }, example: 'userName eq "alice@example.com"' }
+        - { name: startIndex, in: query, required: false, schema: { type: integer, default: 1 } }
+        - { name: count, in: query, required: false, schema: { type: integer, default: 100 } }
+      responses:
+        '200':
+          description: User list
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimListResponse'
+        '400':
+          $ref: '#/components/responses/ScimBadRequest'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+    post:
+      tags: [scim]
+      summary: Provision a SCIM user
+      description: Creates a passwordless `managed` user. Login happens later via OIDC (claimable path). `userName` conflicts return 409.
+      operationId: scimCreateUser
+      security:
+        - scimBearer: []
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimUser'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '409':
+          $ref: '#/components/responses/ScimConflict'
+
+  /scim/v2/Users/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [scim]
+      summary: Get a SCIM user
+      operationId: scimGetUser
+      security:
+        - scimBearer: []
+      responses:
+        '200':
+          description: User
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
+    put:
+      tags: [scim]
+      summary: Replace a SCIM user
+      operationId: scimReplaceUser
+      security:
+        - scimBearer: []
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimUser'
+      responses:
+        '200':
+          description: User replaced
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
+    patch:
+      tags: [scim]
+      summary: Patch a SCIM user
+      description: Applies a SCIM PatchOp. Typically toggles `active` for deactivation/reactivation.
+      operationId: scimPatchUser
+      security:
+        - scimBearer: []
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimPatchOp'
+      responses:
+        '200':
+          description: User patched
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimUser'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
+    delete:
+      tags: [scim]
+      summary: Deprovision a SCIM user
+      description: |-
+        Soft-disables the user (`active=false`) by default; hard-deletes (cascade)
+        when `GRADIENT_SCIM_HARD_DELETE=true`.
+      operationId: scimDeleteUser
+      security:
+        - scimBearer: []
+      responses:
+        '204':
+          description: User deprovisioned
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
+
+  /scim/v2/Groups:
+    get:
+      tags: [scim]
+      summary: List SCIM groups
+      description: |-
+        Lists SCIM groups. A SCIM group is an IdP group name that resolves to
+        `(organization, role)` grants via `scim_group` on a state role; groups are
+        not created through SCIM. Supports the `displayName eq "..."` filter.
+      operationId: scimListGroups
+      security:
+        - scimBearer: []
+      parameters:
+        - { name: filter, in: query, required: false, schema: { type: string }, example: 'displayName eq "acme-eng"' }
+      responses:
+        '200':
+          description: Group list
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimListResponse'
+        '400':
+          $ref: '#/components/responses/ScimBadRequest'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+
+  /scim/v2/Groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string }, description: SCIM group name (IdP group) }
+    get:
+      tags: [scim]
+      summary: Get a SCIM group
+      description: Unknown group names return 404.
+      operationId: scimGetGroup
+      security:
+        - scimBearer: []
+      responses:
+        '200':
+          description: Group
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
+    patch:
+      tags: [scim]
+      summary: Patch SCIM group membership
+      description: |-
+        Adds or removes members. Membership maps to `organization_user` grants for
+        the `(organization, role)` the group resolves to. Unknown group names return 404.
+      operationId: scimPatchGroup
+      security:
+        - scimBearer: []
+      requestBody:
+        required: true
+        content:
+          application/scim+json:
+            schema:
+              $ref: '#/components/schemas/ScimPatchOp'
+      responses:
+        '200':
+          description: Group patched
+          content:
+            application/scim+json:
+              schema:
+                $ref: '#/components/schemas/ScimGroup'
+        '401':
+          $ref: '#/components/responses/ScimUnauthorized'
+        '404':
+          $ref: '#/components/responses/ScimNotFound'
 
 components:
 
@@ -5269,6 +6716,13 @@ components:
       description: |-
         Operator-configured bearer token loaded from `GRADIENT_METRICS_TOKEN_FILE`.
         Independent of user authentication.
+    scimBearer:
+      type: http
+      scheme: bearer
+      description: |-
+        Operator-configured SCIM provisioning token loaded from
+        `GRADIENT_SCIM_TOKEN_FILE`. Presented by the IdP (Okta/Entra) on every
+        `/scim/v2` request. Independent of user authentication.
 
   parameters:
     OrganizationSlug:
@@ -5368,6 +6822,34 @@ components:
           example:
             error: true
             message: "Server Name already exists"
+
+    ScimUnauthorized:
+      description: Missing or invalid SCIM bearer token
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/ScimError'
+
+    ScimBadRequest:
+      description: Unsupported filter or invalid value
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/ScimError'
+
+    ScimNotFound:
+      description: Resource not found
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/ScimError'
+
+    ScimConflict:
+      description: Resource already exists (uniqueness)
+      content:
+        application/scim+json:
+          schema:
+            $ref: '#/components/schemas/ScimError'
 
   schemas:
 
@@ -5622,7 +7104,7 @@ components:
 
     OrgWorkerEntry:
       type: object
-      required: [worker_id, display_name, registered_at, active, enable_fetch, enable_eval, enable_build]
+      required: [worker_id, display_name, registered_at, active, enable_fetch, enable_eval, enable_build, is_base]
       properties:
         worker_id:
           type: string
@@ -5655,6 +7137,9 @@ components:
         enable_build:
           type: boolean
           description: Server-side gate for the worker's `build` capability for this registration.
+        is_base:
+          type: boolean
+          description: Whether this entry is a server-level base worker (visible to every org, managed via state).
         live:
           allOf:
             - $ref: '#/components/schemas/WorkerLiveInfo'
@@ -5693,6 +7178,23 @@ components:
         draining:
           type: boolean
           description: Whether the worker is draining (no new jobs will be dispatched)
+
+    WorkerTestResponse:
+      type: object
+      required: [ok, connected, authorized_for_org, message]
+      properties:
+        ok:
+          type: boolean
+          description: Whether the test passed overall
+        connected:
+          type: boolean
+          description: Whether the worker is currently connected to the server
+        authorized_for_org:
+          type: boolean
+          description: Whether the worker successfully authorized for the requesting organization
+        message:
+          type: string
+          description: Human-readable summary of the test result
 
     ListItem:
       type: object
@@ -6013,7 +7515,7 @@ components:
 
     ActionType:
       type: string
-      enum: [send_mail, send_web_request, forge_status_report]
+      enum: [send_mail, send_web_request, forge_status_report, open_pr]
 
     ActionConfigSendMail:
       type: object
@@ -6041,11 +7543,47 @@ components:
         type: { type: string, enum: [forge_status_report] }
         integration_id: { type: string, format: uuid }
 
+    ActionConfigOpenPr:
+      type: object
+      required: [type, integration_id]
+      properties:
+        type: { type: string, enum: [open_pr] }
+        integration_id:
+          type: string
+          format: uuid
+          description: Outbound forge integration in the same org
+        generator:
+          type: string
+          enum: [flake_lock]
+          default: flake_lock
+          description: Update generator; only the native flake.lock updater is available in v1
+        granularity:
+          type: string
+          enum: [per_run, per_input]
+          default: per_run
+          description: One PR for the whole run, or one PR per tracked input
+        verify_gate:
+          type: string
+          enum: [none, eval, build]
+          default: build
+          description: How far the candidate lock is verified before the PR is opened
+        branch_pattern:
+          type: string
+          default: gradient/flake-lock-update
+          description: Branch name for the PR; with `per_input` it must contain the `{input}` placeholder
+        title_template: { type: string, nullable: true }
+        body_template: { type: string, nullable: true }
+        update_existing:
+          type: boolean
+          default: true
+          description: Update an already-open PR in place instead of opening a duplicate
+
     ActionConfig:
       oneOf:
         - { $ref: '#/components/schemas/ActionConfigSendMail' }
         - { $ref: '#/components/schemas/ActionConfigSendWebRequest' }
         - { $ref: '#/components/schemas/ActionConfigForgeStatusReport' }
+        - { $ref: '#/components/schemas/ActionConfigOpenPr' }
       discriminator:
         propertyName: type
 
@@ -6288,18 +7826,6 @@ components:
         created_at:
           type: string
           format: date-time
-        github_installation_id:
-          type: integer
-          format: int64
-          nullable: true
-          description: >-
-            GitHub App installation ID bound to this org. The presence of this
-            value (non-null) is the single signal that this org uses the GitHub
-            App - outbound CI status reporting and webhook routing both gate on
-            it. Populated automatically by the `installation` webhook (when the
-            GitHub login matches the Gradient org name) and by the state-driven
-            provisioner (`StateOrganization.github_installation_id`); cleared
-            automatically when GitHub sends `installation.deleted`.
         github_app_available:
           type: boolean
           description: >-
@@ -6418,19 +7944,61 @@ components:
 
     EntryPointSummary:
       type: object
-      required: [build_id, name]
+      required: [id, build_id, derivation_path, eval, build_status, has_artefacts, architecture, deps, created_at]
       properties:
-        build_id:
+        id: { type: string, format: uuid }
+        build_id: { type: string, format: uuid }
+        derivation_path: { type: string, description: "Prefix-free `.drv` store path (`<hash>-<name>.drv`, no `/nix/store/`)" }
+        eval:
           type: string
-          format: uuid
-          description: UUID of the root build
-        name:
+          description: Nix attribute path of the entry point
+        build_status:
+          $ref: '#/components/schemas/BuildStatus'
+        has_artefacts: { type: boolean }
+        architecture:
           type: string
-          description: Human-readable derivation name
+          description: Nix system string, e.g. x86_64-linux
+        build_time_ms:
+          type: integer
+          nullable: true
+          description: Wall time of the entry point's own build (latest attempt)
+        deps:
+          $ref: '#/components/schemas/BuildStatusCounts'
+        deps_total:
+          type: integer
+          nullable: true
+          description: >-
+            Total build-time dependency-closure size, cached on the derivation
+            (content-addressed, reused across evals). null for evals predating
+            the cache.
+        created_at: { type: string, format: date-time }
+
+    BuildStatusCounts:
+      type: object
+      required: [completed, failed, building, queued, substituted, aborted]
+      description: >-
+        Four-segment build-status rollup shared by every segmented bar.
+        completed=Completed; failed=FailedPermanent|FailedTimeout|DependencyFailed;
+        building=Building; queued=Queued|Created|FailedTransient.
+        substituted and aborted are reported separately and excluded from bars and from total_builds.
+      properties:
+        completed: { type: integer }
+        failed: { type: integer }
+        building: { type: integer }
+        queued: { type: integer }
+        substituted: { type: integer }
+        aborted: { type: integer }
+
+    QueueSummary:
+      type: object
+      required: [building, queued]
+      properties:
+        building: { type: integer }
+        queued: { type: integer }
 
     EvaluationSummary:
       type: object
-      required: [id, commit, status, total_builds, failed_builds, completed_entry_points, failed_entry_points, created_at, updated_at]
+      required: [id, commit, status, total_builds, builds, errors, warnings, created_at, updated_at]
       properties:
         id:
           type: string
@@ -6438,24 +8006,37 @@ components:
         commit:
           type: string
           description: Hex-encoded commit hash
+        commit_message:
+          type: string
+          nullable: true
+          description: First non-blank line of the commit message, truncated to 100 chars; null when the message is blank
+        kind:
+          $ref: '#/components/schemas/EvaluationKind'
         status:
           $ref: '#/components/schemas/EvaluationStatus'
-        total_builds:
-          type: integer
-          description: Total number of builds in this evaluation
-        failed_builds:
-          type: integer
-          description: Number of failed builds
-        completed_entry_points:
-          type: integer
-          description: Number of entry points with Completed build status
-        failed_entry_points:
-          type: integer
-          description: Number of entry points with Failed build status
-        entry_point_diff:
+        trigger:
+          allOf:
+            - $ref: '#/components/schemas/EvaluationTriggerSummary'
+          nullable: true
+        triggered_by:
+          type: string
+          nullable: true
+          description: Display name of the user who manually started the evaluation; null for trigger-driven runs
+        pr_number:
           type: integer
           nullable: true
-          description: Difference in entry point count compared to the previous evaluation (null if no previous evaluation)
+          description: PR/MR number for pull-request-triggered evaluations (for the "PR #42" label); null otherwise
+        total_builds:
+          type: integer
+          description: Sum of the four bar segments (excludes substituted and aborted)
+        builds:
+          $ref: '#/components/schemas/BuildStatusCounts'
+        errors:
+          type: integer
+          description: Count of evaluation messages with level Error
+        warnings:
+          type: integer
+          description: Count of evaluation messages with level Warning
         created_at:
           type: string
           format: date-time
@@ -6479,6 +8060,8 @@ components:
         - can_edit
         - can_trigger
         - managed
+        - last_check_at
+        - queue
       properties:
         id:
           type: string
@@ -6514,6 +8097,13 @@ components:
         managed:
           type: boolean
           description: True when the project is managed by declarative Nix state and cannot be edited via the UI.
+        last_check_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of the most recent repository check; null while a re-check is pending
+        queue:
+          $ref: '#/components/schemas/QueueSummary'
 
     ProjectMetricsResponse:
       type: object
@@ -6551,6 +8141,10 @@ components:
           type: integer
           nullable: true
           description: Total closure size including all transitive dependencies
+        runtime_closure_size_bytes:
+          type: integer
+          nullable: true
+          description: Total runtime reference closure size of the entry-point outputs
         dependencies_count:
           type: integer
           description: Number of dependency builds (excluding entry points)
@@ -6573,11 +8167,15 @@ components:
 
     EntryPointMetricPoint:
       type: object
-      required: [evaluation_id, created_at, build_status, dependencies_count]
+      required: [evaluation_id, build_id, created_at, build_status, dependencies_count]
       properties:
         evaluation_id:
           type: string
           format: uuid
+        build_id:
+          type: string
+          format: uuid
+          description: Entry-point build for this evaluation (target of the closure view)
         created_at:
           type: string
           format: date-time
@@ -6598,12 +8196,27 @@ components:
           format: int64
           nullable: true
           description: Total closure size including all transitive dependency outputs
+        runtime_closure_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Total runtime reference closure size of the entry-point build's outputs
         dependencies_count:
           type: integer
           format: int64
           description: Number of transitive dependency builds (excluding the entry point itself)
 
     # ── Evaluations ───────────────────────────────────────────────────────────
+
+    EvaluationKind:
+      type: string
+      enum: [normal, input_update]
+      default: normal
+      description: |-
+        | Value | Meaning |
+        |---|---|
+        | `normal` | Ordinary evaluation of the project's flake |
+        | `input_update` | Evaluation of a candidate flake.lock with tracked inputs bumped, driving an `open_pr` action |
 
     EvaluationStatus:
       type: string
@@ -6643,6 +8256,8 @@ components:
         wildcard:
           type: string
           description: Nix attribute wildcard that was evaluated
+        kind:
+          $ref: '#/components/schemas/EvaluationKind'
         status:
           $ref: '#/components/schemas/EvaluationStatus'
         trigger:
@@ -6650,6 +8265,10 @@ components:
             - $ref: '#/components/schemas/EvaluationTriggerSummary'
           nullable: true
           description: The trigger that initiated this evaluation, or null if started manually.
+        triggered_by:
+          type: string
+          nullable: true
+          description: Display name of the user who manually started this evaluation; null otherwise.
         previous:
           type: string
           format: uuid
@@ -6666,6 +8285,10 @@ components:
         warning_count:
           type: integer
           description: Number of warning-level messages recorded during evaluation
+        error:
+          type: string
+          nullable: true
+          description: Concatenated text of the evaluation's error-level messages, or null when there are none.
         created_at:
           type: string
           format: date-time
@@ -6679,15 +8302,17 @@ components:
       description: |
         Populated only when `status == "Waiting"`. Tagged by `kind`:
 
-        - `workers`: no connected worker can satisfy the pending builds'
-          `(architecture, required_features)` combos. Also used at evaluation
-          creation time with `connected_workers: 0` when the project's
-          organisation has no active worker registration with `enable_eval`
-          (issue #268) - the eval would otherwise be stranded in `Queued`
-          forever, because the build-dispatch reconciler can only act on
-          builds the eval phase has not yet produced. Refreshed whenever
+        - `workers`: the evaluation has reached the build phase but no
+          connected worker can satisfy the pending builds'
+          `(architecture, required_features)` combos. Refreshed whenever
           the scheduler reconciles the evaluation against the live worker
           pool.
+        - `eval_workers`: the evaluation is still in a pre-build phase and no
+          connected worker provides the capability it needs. `capability` is
+          `fetch` while `Fetching` (the worker must fetch the flake sources) or
+          `eval` while `Queued`/`EvaluatingFlake`/`EvaluatingDerivation` (the
+          worker must run the evaluation). Auto-unparks to `Queued` the moment a
+          worker with that capability connects (issue #381).
         - `approval`: the PR comes from a contributor who is not a forge
           repo writer, and the trigger has `require_approval = true`. The
           evaluation stays parked until a maintainer clicks "Approve and
@@ -6701,16 +8326,30 @@ components:
           subscription, so build outputs would have nowhere to land. The
           evaluation auto-unparks the moment a writable cache is
           subscribed.
+        - `cache_storage_full`: every writable cache for the organisation is
+          within the headroom threshold of its (or the instance-wide)
+          max-storage limit, so build outputs would have nowhere to land.
+        - `graph_stuck`: the connected pool can build every pending anchor, but
+          none is dispatchable - the whole pending set is blocked behind the
+          dependency-closure gate with no in-flight build to drive promotion. The
+          scheduler self-heals the gate and re-promotes on each pass;
+          `pending_anchors` is the blocked count.
       oneOf:
         - $ref: '#/components/schemas/WaitingReasonWorkers'
+        - $ref: '#/components/schemas/WaitingReasonEvalWorkers'
         - $ref: '#/components/schemas/WaitingReasonApproval'
         - $ref: '#/components/schemas/WaitingReasonNoCache'
+        - $ref: '#/components/schemas/WaitingReasonCacheStorageFull'
+        - $ref: '#/components/schemas/WaitingReasonGraphStuck'
       discriminator:
         propertyName: kind
         mapping:
           workers: '#/components/schemas/WaitingReasonWorkers'
+          eval_workers: '#/components/schemas/WaitingReasonEvalWorkers'
           approval: '#/components/schemas/WaitingReasonApproval'
           no_cache: '#/components/schemas/WaitingReasonNoCache'
+          cache_storage_full: '#/components/schemas/WaitingReasonCacheStorageFull'
+          graph_stuck: '#/components/schemas/WaitingReasonGraphStuck'
 
     WaitingReasonWorkers:
       type: object
@@ -6753,6 +8392,28 @@ components:
           type: string
           description: Forge login of the PR author whose contribution is being gated.
 
+    WaitingReasonEvalWorkers:
+      type: object
+      required: [kind, capability, connected_workers]
+      properties:
+        kind:
+          type: string
+          enum: [eval_workers]
+        capability:
+          type: string
+          enum: [fetch, eval]
+          description: |
+            The pre-build capability the evaluation is stranded on: `fetch`
+            (waiting for a worker to fetch the flake sources) or `eval`
+            (waiting for a worker to run the evaluation).
+        connected_workers:
+          type: integer
+          minimum: 0
+          description: |
+            Total workers currently connected. May be greater than zero when
+            only build-only workers are online and an eval/fetch worker is
+            missing.
+
     WaitingReasonNoCache:
       type: object
       required: [kind]
@@ -6760,6 +8421,26 @@ components:
         kind:
           type: string
           enum: [no_cache]
+
+    WaitingReasonCacheStorageFull:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [cache_storage_full]
+
+    WaitingReasonGraphStuck:
+      type: object
+      required: [kind, pending_anchors]
+      properties:
+        kind:
+          type: string
+          enum: [graph_stuck]
+        pending_anchors:
+          type: integer
+          minimum: 0
+          description: Number of pending builds blocked behind the dependency-closure gate.
 
     UnmetRequirement:
       type: object
@@ -6826,10 +8507,10 @@ components:
           format: uuid
         name:
           type: string
-          description: Full derivation store path
+          description: Prefix-free `.drv` store path (`<hash>-<name>.drv`, no `/nix/store/`)
         status:
           type: string
-          description: Build status string (e.g. `"Queued"`, `"Building"`, `"Succeeded"`)
+          description: Build status string (e.g. `"Queued"`, `"Building"`, `"Completed"`, `"Substituted"`)
         updated_at:
           type: string
           format: date-time
@@ -6863,8 +8544,8 @@ components:
           description: Attribute path (e.g. `checks.x86_64-linux.foo`)
         derivation:
           type: string
-          description: Full `.drv` store path
-          example: "/nix/store/abc123-hello-2.12.1.drv"
+          description: Prefix-free `.drv` store path (`<hash>-<name>.drv`, no `/nix/store/`)
+          example: "abc123-hello-2.12.1.drv"
         build_id:
           type: string
           format: uuid
@@ -6883,8 +8564,8 @@ components:
           description: Output name (e.g. `out`, `lib`, `dev`)
         store_path:
           type: string
-          description: Full output store path
-          example: "/nix/store/abc123-hello-2.12.1"
+          description: Prefix-free output store path (`<hash>-<name>`, no `/nix/store/`)
+          example: "abc123-hello-2.12.1"
         products:
           type: array
           items:
@@ -7012,13 +8693,38 @@ components:
           description: |-
             Synthetic commit row pointing at the materialised
             `/nix/store/<hash>-source` path. `hash` is a 20-byte zero placeholder.
+        cache:
+          type: string
+          nullable: true
+          description: |-
+            Name of the org cache the build output is signed into, for the
+            client to substitute from (`<server>/cache/<cache>`). `null` when
+            the organization has no cache.
 
     # ── Builds ────────────────────────────────────────────────────────────────
 
     BuildStatus:
       type: string
-      enum: [Queued, Building, Succeeded, Failed, Cancelled]
-      description: Current state of a single build
+      enum: [Queued, Building, Completed, Substituted, FailedPermanent, FailedTransient, FailedTimeout, Aborted, DependencyFailed]
+      description: |-
+        Current state of a single build.
+
+        | Value | Terminal | Meaning |
+        |---|---|---|
+        | `Queued` | No | Waiting to be dispatched to a worker |
+        | `Building` | No | Actively executing on a worker |
+        | `Completed` | Yes | Build executed successfully |
+        | `Substituted` | Yes | Outputs were already present (in the local store or pre-evaluated); no build ran |
+        | `FailedPermanent` | Yes | Builder exited non-zero; no retry will be attempted |
+        | `FailedTransient` | No | Transient failure (OOM, disk full, network error); an automatic retry is pending |
+        | `FailedTimeout` | Yes | Exceeded the wall-clock or silent-output timeout |
+        | `Aborted` | Yes | Cancelled by user |
+        | `DependencyFailed` | Yes | A dependency build failed, so this build was not attempted |
+
+        `FailedTransient` is non-terminal: the scheduler will re-queue the build
+        automatically. Treat it as in-progress when deciding whether an evaluation
+        has finished. The frontend renders `FailedPermanent`, `FailedTransient`, and
+        `FailedTimeout` all as "Failed", and `Completed`/`Substituted` both as success.
 
     Architecture:
       type: string
@@ -7038,6 +8744,11 @@ components:
         id:
           type: string
           format: uuid
+          description: |-
+            Per-evaluation build identity (`build_job` id). The build *state*
+            (status, worker, log) comes from the global `derivation_build`
+            anchor shared by every evaluation that needs this derivation, so a
+            derivation is built exactly once and the result is reused.
         evaluation:
           type: string
           format: uuid
@@ -7045,8 +8756,8 @@ components:
           $ref: '#/components/schemas/BuildStatus'
         derivation_path:
           type: string
-          description: Full Nix store path of the `.drv` file
-          example: "/nix/store/abc123-hello-2.12.1.drv"
+          description: Prefix-free `.drv` store path (`<hash>-<name>.drv`, no `/nix/store/`)
+          example: "abc123-hello-2.12.1.drv"
         architecture:
           $ref: '#/components/schemas/Architecture'
         worker:
@@ -7054,26 +8765,15 @@ components:
           nullable: true
           description: |-
             Worker identity (the `worker_id` string the worker sent in
-            `InitConnection`) that executed this build. `null` if the
+            `InitConnection`) that executed this build's anchor. `null` if the
             build has not yet reached a worker (still queued, aborted
-            before dispatch, or a pre-migration row).
-        via:
-          type: string
-          format: uuid
-          nullable: true
-          description: |-
-            When set, this build is a *follower* of another build (same
-            derivation, different evaluation) whose terminal status will be
-            copied here. The scheduler does not dispatch builds with `via`
-            set; this avoids two workers racing for the Nix store lock on the
-            same output path when multiple projects build the same package.
-            See issue #175.
+            before dispatch, or never dispatched in this evaluation).
         output:
           type: object
           additionalProperties:
             type: string
           description: |-
-            Map of output name → Nix store path (e.g. `{"out": "/nix/store/xyz-hello-2.12.1"}`)
+            Map of output name → prefix-free store path (e.g. `{"out": "xyz-hello-2.12.1"}`)
         created_at:
           type: string
           format: date-time
@@ -7096,8 +8796,8 @@ components:
           example: hello-2.12.1
         path:
           type: string
-          description: Full Nix store path of the `.drv`
-          example: "/nix/store/abc123-hello-2.12.1.drv"
+          description: Prefix-free `.drv` store path (`<hash>-<name>.drv`, no `/nix/store/`)
+          example: "abc123-hello-2.12.1.drv"
         status:
           type: string
           description: Build status string
@@ -7121,6 +8821,76 @@ components:
           format: uuid
           description: Build that depends on `source`
 
+    LogChunkMeta:
+      type: object
+      required: [index, line_start, line_count, byte_start, byte_len]
+      properties:
+        index:
+          type: integer
+          format: int32
+          description: Zero-based chunk index.
+        line_start:
+          type: integer
+          format: int64
+          description: Zero-based index of this chunk's first line.
+        line_count:
+          type: integer
+          format: int32
+        byte_start:
+          type: integer
+          format: int64
+          description: Uncompressed byte offset of this chunk's first byte.
+        byte_len:
+          type: integer
+          format: int32
+
+    LogChunkIndex:
+      type: object
+      required: [total_chunks, total_lines, total_bytes, chunks]
+      properties:
+        total_chunks:
+          type: integer
+          format: int32
+        total_lines:
+          type: integer
+          format: int64
+        total_bytes:
+          type: integer
+          format: int64
+        chunks:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogChunkMeta'
+
+    LogSearchHit:
+      type: object
+      required: [line_number, chunk_index, byte_offset, preview]
+      properties:
+        line_number:
+          type: integer
+          format: int64
+          description: 1-based line number of the match.
+        chunk_index:
+          type: integer
+          format: int32
+        byte_offset:
+          type: integer
+          format: int64
+        preview:
+          type: string
+          description: The matching line (trimmed, max 200 chars).
+
+    LogSearchDone:
+      type: object
+      required: [done, total_matches]
+      properties:
+        done:
+          type: boolean
+          enum: [true]
+        total_matches:
+          type: integer
+          format: int64
+
     BuildGraph:
       type: object
       required: [root, nodes, edges]
@@ -7139,6 +8909,114 @@ components:
           items:
             $ref: '#/components/schemas/DependencyEdge'
           description: Dependency edges (`source` → `target` means source must be built before target)
+
+    ClosureNode:
+      type: object
+      required: [id, name, path, nar_size]
+      properties:
+        id:
+          type: string
+          description: Node id - derivation UUID (build closure) or store-path hash (runtime closure)
+        name:
+          type: string
+          example: hello-2.12.1
+        path:
+          type: string
+          description: Prefix-free store path (`<hash>-<name>`, no `/nix/store/`)
+        nar_size:
+          type: integer
+          format: int64
+          nullable: true
+          description: Coalesced uncompressed NAR size of the derivation's outputs (null when unknown)
+
+    ClosureEdge:
+      type: object
+      required: [source, target]
+      properties:
+        source:
+          type: string
+          description: Dependency node id
+        target:
+          type: string
+          description: Node id that depends on `source`
+
+    ClosureGraph:
+      type: object
+      required: [roots, total_size_bytes, node_count, edge_count, truncated, nodes, edges]
+      properties:
+        roots:
+          type: array
+          items:
+            type: string
+          description: Seed node ids (one for a build, all entry points for an evaluation)
+        total_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          description: Exact sum of NAR sizes over the whole closure, independent of the node cap
+        node_count:
+          type: integer
+          description: Number of nodes returned (after the cap)
+        edge_count:
+          type: integer
+        truncated:
+          type: boolean
+          description: True when the closure exceeded the node cap and the node/edge lists were trimmed (largest nodes kept)
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClosureNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClosureEdge'
+
+    ExpensiveEval:
+      type: object
+      required: [evaluation, organization, name, value, unit, worker]
+      properties:
+        evaluation:
+          type: string
+          format: uuid
+        organization:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Evaluation wildcard (entry-point attribute pattern)
+        value:
+          type: number
+          format: double
+          description: Captured metric value in the metric's `unit`
+        unit:
+          type: string
+          description: Unit of `value` (MB, count, bytes, or ms depending on the metric)
+        worker:
+          type: string
+          description: Worker that produced the evaluation metric
+
+    FlakeGraphNode:
+      type: object
+      required: [path, name, kind, is_derivation]
+      properties:
+        path:
+          type: string
+          description: Attribute path of the flake output node
+        parent:
+          type: string
+          nullable: true
+          description: Attribute path of the parent node (null at the root)
+        name:
+          type: string
+        kind:
+          type: string
+          description: Node kind (e.g. attrset or derivation)
+        is_derivation:
+          type: boolean
+        drv_path:
+          type: string
+          nullable: true
+          description: Prefix-free `.drv` store path (`<hash>-<name>.drv`) when the node is a derivation
 
     BuildProduct:
       type: object
@@ -7196,6 +9074,12 @@ components:
             Alternate Priority returned in nix-cache-info when the client
             IP is in the server's local_ips list. Null or 0 disables the
             override.
+        max_storage_gb:
+          type: integer
+          format: int32
+          default: 0
+          minimum: 0
+          description: Max cache storage in GB. 0 (default) = unlimited; otherwise at least 1.
 
     PatchCacheRequest:
       type: object
@@ -7216,6 +9100,11 @@ components:
             Alternate Priority returned in nix-cache-info when the client
             IP is in the server's local_ips list. Null or 0 disables the
             override.
+        max_storage_gb:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Max cache storage in GB. 0 = unlimited; otherwise at least 1.
 
     Cache:
       type: object
@@ -7240,6 +9129,10 @@ components:
             Alternate Priority returned in nix-cache-info when the client
             IP is in the server's local_ips list. Null or 0 disables the
             override.
+        max_storage_gb:
+          type: integer
+          format: int32
+          description: Max cache storage in GB. 0 = unlimited; otherwise at least 1.
         active:
           type: boolean
           description: Whether the cache is publicly accessible
@@ -7274,6 +9167,7 @@ components:
           description: Store-path hash (the part before the first `-` in `/nix/store/<hash>-<name>`)
         store_path:
           type: string
+          description: Prefix-free store path (`<hash>-<name>`, no `/nix/store/`)
         package:
           type: string
         nar_size:
@@ -7300,6 +9194,7 @@ components:
           type: string
         store_path:
           type: string
+          description: Prefix-free store path (`<hash>-<name>`, no `/nix/store/`)
         package:
           type: string
         nar_size:
@@ -7589,6 +9484,15 @@ components:
             source is allowed. Inbound deliveries from outside the allowlist
             are rejected with `403 forbidden_source_ip` (after signature
             verification succeeds).
+        installation_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: GitHub App installation id. Non-null for `forge_type=github` rows.
+        account_login:
+          type: string
+          nullable: true
+          description: GitHub account login the installation is bound to. Non-null for `forge_type=github` rows.
         created_by:
           type: string
           format: uuid
@@ -7635,11 +9539,17 @@ components:
           enum: [inbound, outbound]
         forge_type:
           type: string
-          enum: [gitea, forgejo, gitlab]
+          enum: [gitea, forgejo, gitlab, github]
           description: >-
-            `github` is intentionally excluded - GitHub integration is
-            provided by the server-wide GitHub App and the org's
-            `github_installation_id`, not by per-integration rows.
+            For `github`: supply `installation_id`; the server App must be
+            configured. An inbound + outbound pair is created automatically.
+        installation_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: >-
+            Required when `forge_type` is `github`. The GitHub App installation
+            id to bind. Validated against the App; invalid ids return `400`.
         secret:
           type: string
           description: >-
@@ -7678,9 +9588,10 @@ components:
           type: string
           enum: [gitea, forgejo, gitlab]
           description: >-
-            `github` is rejected here - GitHub integration is provided by the
-            server-wide GitHub App and the org's `github_installation_id`
-            instead.
+            `github` is intentionally excluded from this enum: github rows are
+            installation-managed and not editable (PATCH returns `400`). The
+            schema itself prevents supplying `forge_type=github` here; delete
+            the row to remove a GitHub installation integration.
         endpoint_url:
           type: string
           nullable: true
@@ -8193,3 +10104,307 @@ components:
           type: string
           description: Username of the member to remove.
           example: alice
+
+    # ── Job Board scoring contexts ────────────────────────────────────────────
+
+    Windowed:
+      type: object
+      description: A metric averaged over the 5-minute, 1-hour and 24-hour windows.
+      properties:
+        w5m: { type: number }
+        w1h: { type: number }
+        w24h: { type: number }
+
+    WorkerContext:
+      type: object
+      description: Worker capabilities and live load at dispatch time.
+      properties:
+        architectures: { type: array, items: { type: string } }
+        system_features: { type: array, items: { type: string } }
+        capabilities:
+          type: object
+          properties:
+            core: { type: boolean }
+            federate: { type: boolean }
+            fetch: { type: boolean }
+            eval: { type: boolean }
+            build: { type: boolean }
+            cache: { type: boolean }
+        cpu_count: { type: integer }
+        cpu_core_score: { type: integer }
+        ram_total_mb: { type: integer }
+        ram_free_mb: { type: integer }
+        cpu_usage_pct: { type: number }
+        disk_speed_mbps: { type: number, nullable: true }
+        network_speed_mbps: { type: number, nullable: true }
+
+    JobContext:
+      type: object
+      description: |
+        Per-job scoring inputs. `kind` selects which optional properties are
+        present: the `dependency_count`/`pname`/`closure_size`/`prefer_local_build`/
+        `is_fixed_output`/`history`/`derivations` block is build-only, while
+        `fetch_flake` is eval-only.
+      properties:
+        kind: { type: string, enum: [Build, Eval] }
+        architecture: { type: string }
+        missing_count: { type: integer, nullable: true }
+        missing_nar_size: { type: integer, nullable: true }
+        org_work_share: { type: number, nullable: true }
+        rescore_count: { type: integer }
+        queued_at: { type: string }
+        ready_at: { type: string }
+        dependency_count: { type: integer, description: Build-only. }
+        pname: { type: string, nullable: true, description: Build-only. }
+        closure_size: { type: integer, nullable: true, description: Build-only. }
+        prefer_local_build: { type: boolean, description: Build-only. }
+        is_fixed_output: { type: boolean, description: Build-only. }
+        history:
+          type: object
+          description: Build-only history prediction from prior builds of this derivation.
+          properties:
+            peak_ram_mb: { type: integer }
+            avg_cpu_time_ms: { type: integer }
+            build_time_ms: { type: integer }
+            avg_disk_bytes: { type: integer }
+            oom_rate: { type: number }
+            samples: { type: integer }
+        derivations:
+          type: array
+          description: Build-only list of derivations in this job.
+          items:
+            type: object
+            properties:
+              build_id: { type: string }
+              drv_path: { type: string }
+              pname: { type: string, nullable: true }
+        fetch_flake: { type: boolean, description: Eval-only. }
+
+    InstanceContext:
+      type: object
+      nullable: true
+      description: |
+        Instance-wide windowed averages and live counts at dispatch time,
+        recomputed every `GRADIENT_INSTANCE_METRICS_INTERVAL` seconds. `null`
+        for jobs dispatched before the first snapshot.
+      properties:
+        wait_secs: { $ref: '#/components/schemas/Windowed' }
+        build_time_ms: { $ref: '#/components/schemas/Windowed' }
+        peak_ram_mb: { $ref: '#/components/schemas/Windowed' }
+        cpu_time_ms: { $ref: '#/components/schemas/Windowed' }
+        avg_cpu_pct: { $ref: '#/components/schemas/Windowed' }
+        disk_bytes: { $ref: '#/components/schemas/Windowed' }
+        network_mbps: { $ref: '#/components/schemas/Windowed' }
+        oom_rate: { $ref: '#/components/schemas/Windowed' }
+        closure_size: { $ref: '#/components/schemas/Windowed' }
+        nar_size_mb: { $ref: '#/components/schemas/Windowed' }
+        missing_paths: { $ref: '#/components/schemas/Windowed' }
+        dependency_cnt: { $ref: '#/components/schemas/Windowed' }
+        completed: { $ref: '#/components/schemas/Windowed' }
+        active_builds: { type: integer }
+        pending_builds: { type: integer }
+        total_workers: { type: integer }
+        idle_workers: { type: integer }
+
+    DispatchedJobDetail:
+      type: object
+      description: Full dispatch record with per-rule scoring breakdown and the three scoring contexts.
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: integer }
+        organization: { type: string, format: uuid }
+        organization_name: { type: string }
+        worker_id: { type: string }
+        score: { type: number }
+        queued_at: { type: string, format: date-time }
+        dispatched_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        build_id: { type: string, format: uuid, nullable: true }
+        evaluation_id: { type: string, format: uuid }
+        pname: { type: string, nullable: true }
+        score_breakdown:
+          type: object
+          additionalProperties: true
+          description: Per-rule score contributions.
+        worker_context: { $ref: '#/components/schemas/WorkerContext' }
+        job_context: { $ref: '#/components/schemas/JobContext' }
+        instance_context: { $ref: '#/components/schemas/InstanceContext' }
+        candidates:
+          type: array
+          nullable: true
+          description: Runner-up candidates, superuser-only.
+          items: { type: object, additionalProperties: true }
+        previous_attempts:
+          type: array
+          description: All build attempts for the same build, ordered by creation time ascending.
+          items: { $ref: '#/components/schemas/AttemptSummary' }
+        passed_over:
+          type: boolean
+          description: True when this detail is an in-memory candidate the dispatcher scored but passed over (never persisted); the UI labels it "Passed over".
+
+    AttemptSummary:
+      type: object
+      description: Summary of a single build attempt.
+      properties:
+        dispatched_job_id: { type: string, format: uuid }
+        substitute: { type: boolean }
+        outcome: { type: integer }
+        reason: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    DispatchedJobSummary:
+      type: object
+      description: Summary of a single in-flight dispatched job.
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: integer }
+        organization: { type: string, format: uuid }
+        worker_id: { type: string }
+        score: { type: number }
+        dispatched_at: { type: string, format: date-time }
+        build_id: { type: string, format: uuid, nullable: true }
+        evaluation_id: { type: string, format: uuid }
+        pname: { type: string, nullable: true }
+
+    PendingJobSummary:
+      type: object
+      description: Summary of a single queued but not-yet-dispatched job.
+      properties:
+        kind: { type: integer }
+        organization: { type: string, format: uuid }
+        evaluation_id: { type: string, format: uuid }
+        build_id: { type: string, format: uuid, nullable: true }
+        queued_at: { type: string, format: date-time }
+        dependency_count: { type: integer }
+        pname: { type: string, nullable: true }
+
+    DispatchDecisionCandidate:
+      type: object
+      description: One scored candidate weighed in a dispatch decision.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Ephemeral id navigable via GET /board/jobs/{id} to this candidate's score-breakdown detail, served from the in-memory decision ring.
+        job_id: { type: string }
+        kind: { type: integer }
+        organization: { type: string, format: uuid }
+        build_id: { type: string, format: uuid, nullable: true }
+        evaluation_id: { type: string, format: uuid }
+        pname: { type: string, nullable: true }
+        score: { type: number }
+        won: { type: boolean, description: Whether this candidate won the decision and was dispatched. }
+
+    DispatchDecision:
+      type: object
+      description: A recorded dispatch decision - the candidates a worker was scored against and which (if any) won.
+      properties:
+        at: { type: string, format: date-time }
+        worker_id: { type: string }
+        kind: { type: integer }
+        winner: { type: string, nullable: true }
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/DispatchDecisionCandidate'
+
+    # ── SCIM 2.0 ──────────────────────────────────────────────────────────────
+
+    ScimError:
+      type: object
+      description: SCIM-shaped error (RFC 7644 §3.12), served as `application/scim+json`.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:api:messages:2.0:Error"]
+        status: { type: string, example: "404" }
+        scimType: { type: string, nullable: true, example: "uniqueness" }
+        detail: { type: string, example: "user not found" }
+
+    ScimListResponse:
+      type: object
+      description: SCIM list response envelope (RFC 7644 §3.4.2).
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:api:messages:2.0:ListResponse"]
+        totalResults: { type: integer }
+        startIndex: { type: integer }
+        itemsPerPage: { type: integer }
+        Resources:
+          type: array
+          items: { type: object }
+
+    ScimUser:
+      type: object
+      description: SCIM core User (RFC 7643 §4.1) - the Okta/Entra subset Gradient stores.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:User"]
+        id: { type: string, format: uuid, readOnly: true }
+        userName: { type: string }
+        externalId: { type: string, nullable: true }
+        displayName: { type: string }
+        name:
+          type: object
+          properties:
+            formatted: { type: string }
+        emails:
+          type: array
+          items:
+            type: object
+            properties:
+              value: { type: string }
+              primary: { type: boolean }
+        active: { type: boolean }
+        meta:
+          type: object
+          properties:
+            resourceType: { type: string, example: "User" }
+      required: [userName]
+
+    ScimGroup:
+      type: object
+      description: |-
+        SCIM core Group (RFC 7643 §4.2). `id`/`displayName` are the IdP group name;
+        `members` are users holding the resolved `(organization, role)` grant.
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:schemas:core:2.0:Group"]
+        id: { type: string, example: "acme-eng" }
+        displayName: { type: string, example: "acme-eng" }
+        members:
+          type: array
+          items:
+            type: object
+            properties:
+              value: { type: string, format: uuid }
+              display: { type: string, nullable: true }
+        meta:
+          type: object
+          properties:
+            resourceType: { type: string, example: "Group" }
+
+    ScimPatchOp:
+      type: object
+      description: SCIM PatchOp request (RFC 7644 §3.5.2).
+      properties:
+        schemas:
+          type: array
+          items: { type: string }
+          example: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"]
+        Operations:
+          type: array
+          items:
+            type: object
+            properties:
+              op: { type: string, example: "replace" }
+              path: { type: string, nullable: true, example: "active" }
+              value: {}
+      required: [Operations]

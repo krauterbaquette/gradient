@@ -2,183 +2,563 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
+# Exercises the Gradient REST API surface on a single node - every management
+# endpoint is hit directly (curl) and, where the CLI exposes it, also through
+# `gradient`. Resources are created at runtime so the creation endpoints are
+# tested too. No worker / build store is present, so build-dependent endpoints
+# are checked for correct empty/not-found behaviour. Endpoints needing external
+# services (OIDC, SMTP e-mail verification, forge webhooks, proto websockets,
+# build-request dispatch) have dedicated tests and are out of scope here.
+
 import json
+import time
+
+API = "http://gradient.local/api/v1"
+CLI = "gradient"
 
 start_all()
-
 machine.wait_for_unit("gradient-server.service")
 machine.wait_for_open_port(3000)
-
-with subtest("check nix"):
-    machine.succeed("nix --version")
-
-with subtest("check api health"):
-    print(machine.succeed("curl http://localhost:3000/api/v1/health -i --fail"))
-
-with subtest("check api /auth/basic/register"):
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/auth/basic/register -H 'Content-Type: application/json' -d '{"username": "testuser", "name": "Test User", "email": "test@were.local", "password": "SecureTest123!"}'
-    """))
-
-    assert req.get("error") == False, req.get("message")
-
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/auth/basic/register -H 'Content-Type: application/json' -d '{"username": "testuser", "name": "Test User", "email": "test@were.local", "password": "SecureTest123!"}'
-    """))
-
-    assert req.get("error") == True, "User should already exist, since it was created in last request"
-
-with subtest("check api not authorized"):
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs -H 'Content-Type: application/json'
-    """))
-
-    assert req.get("error") == True, "Should not be authorized"
-
-with subtest("check api /auth/basic/login"):
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/auth/basic/login -H 'Content-Type: application/json' -d '{"loginname": "testuser", "password": "SecureTest123!"}'
-    """))
-
-    assert req.get("error") == False, req.get("message")
-
-    user_token = req.get("message")
-    print(f"User token: {user_token}")
-
-with subtest("check api user authorization"):
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs -H 'Authorization: Bearer user_token' -H 'Content-Type: application/json'
-    """.replace("user_token", user_token)))
-
-    assert req.get("error") == False, req.get("message")
+machine.wait_for_unit("nginx.service")
 
 
-with subtest("check api /user/keys"):
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/user/keys -H 'Authorization: Bearer user_token' -H 'Content-Type: application/json' -d '{"name": "MyApiKey"}'
-    """.replace("user_token", user_token)))
+def banner(msg):
+    print(f"\n=== {msg} ===")
 
-    assert req.get("error") == False, req.get("message")
 
-    api_key = req.get("message")
-    print(f"API Key: {api_key}")
+def curl(method, path, token=None, body=None, headers=None):
+    cmd = f"curl -sS -X {method} {API}/{path}"
+    if token:
+        cmd += f" -H 'Authorization: Bearer {token}'"
+    if body is not None:
+        cmd += f" -H 'Content-Type: application/json' -d '{body}'"
+    for h in headers or []:
+        cmd += f" -H '{h}'"
+    return machine.succeed(cmd)
 
-with subtest("check api key authorization"):
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key)))
 
-    assert req.get("error") == False, req.get("message")
+def api(method, path, token=None, body=None, expect_error=False):
+    out = curl(method, path, token=token, body=body)
+    j = json.loads(out)
+    if expect_error:
+        assert j.get("error") is True, f"{method} {path}: expected error, got {out}"
+    else:
+        assert j.get("error") is False, f"{method} {path}: {j.get('message')}"
+    return j.get("message")
 
-with subtest("check api /orgs"):
-    req = json.loads(machine.succeed("""
-        curl -XPUT http://localhost:3000/api/v1/orgs -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json' -d '{"name": "myorganization", "display_name": "My Organization", "description": "My Organization"}'
-    """.replace("api_key", api_key)))
 
-    assert req.get("error") == False, req.get("message")
+def cli(args):
+    return machine.succeed(f"{CLI} --json {args}")
 
-    org_id = req.get("message")
-    print(f"Organization ID: {org_id}")
 
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key)))
+def status(method, path, token=None, code=200):
+    cmd = f"curl -sS -o /dev/null -w '%{{http_code}}' -X {method} {API}/{path}"
+    if token:
+        cmd += f" -H 'Authorization: Bearer {token}'"
+    out = machine.succeed(cmd).strip()
+    assert out == str(code), f"{method} {path}: expected {code}, got {out}"
 
-    assert req.get("error") == False, req.get("message")
-    orgs = req.get("message").get("items")
-    assert len(orgs) == 1, "Should have only one organization"
-    assert orgs[0].get("id") == org_id, "Organization ID should match"
 
-with subtest("check api /orgs/{organization}"):
-    org_name = "myorganization"
+# ── Phase 0: health ───────────────────────────────────────────────────────────
+banner("Phase 0: health")
+print(machine.succeed(f"curl -sS --fail {API}/health -i"))
+api("GET", "health")
 
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs/org_name -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+# ── Phase 1: auth + registration ──────────────────────────────────────────────
+banner("Phase 1: auth")
+api("POST", "auth/check-username", body=json.dumps({"username": "operator"}))  # available
 
-    assert req.get("error") == False, req.get("message")
-    assert req.get("message").get("id") == org_id, "Organization ID should match"
+api("POST", "auth/basic/register", body=json.dumps({
+    "username": "operator", "name": "Operator User",
+    "email": "operator@gradient.local", "password": "SecureTest123!",
+}))
+api("POST", "auth/basic/register", expect_error=True, body=json.dumps({
+    "username": "operator", "name": "Operator User",
+    "email": "operator@gradient.local", "password": "SecureTest123!",
+}))
+api("POST", "auth/check-username", expect_error=True,
+    body=json.dumps({"username": "operator"}))  # now taken
 
-    req = json.loads(machine.succeed("""
-        curl -XPUT http://localhost:3000/api/v1/projects/org_name -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json' -d '{"name": "myproject", "display_name": "My Project", "description": "My Project", "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+api("GET", "orgs", expect_error=True)  # no token -> rejected
 
-    assert req.get("error") == False, req.get("message")
+token = api("POST", "auth/basic/login", body=json.dumps({
+    "loginname": "operator", "password": "SecureTest123!",
+}))
+assert token, "login returned empty token"
+api("GET", "orgs", token=token)  # token authorizes
 
-    project_id = req.get("message")
-    print(f"Project ID: {project_id}")
+# A second user, used later for org/cache membership flows. Lookup is by username.
+# The auth surface is rate-limited (burst 5, one token refilled every 6s); the
+# calls above exhaust the burst, so wait for a token before this 6th request.
+member = "teammate"
+time.sleep(8)
+api("POST", "auth/basic/register", body=json.dumps({
+    "username": member, "name": "Team Mate",
+    "email": "teammate@gradient.local", "password": "SecureTest123!",
+}))
 
-with subtest("check api /orgs/{organization}/ssh"):
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs/org_name/ssh -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+# Public/unauthenticated-ish reads.
+print(machine.succeed(f"curl -sS {API}/config -i"))
+machine.execute(f"curl -sS {API}/metrics -o /dev/null -w '%{{http_code}}'")
 
-    assert req.get("error") == False, req.get("message")
+# ── Phase 2: user + api keys ──────────────────────────────────────────────────
+banner("Phase 2: user + api keys")
+me = api("GET", "user", token=token)
+assert me.get("username") == "operator", me
 
-    ssh_key = req.get("message")
+api("PATCH", "user/settings", token=token, body=json.dumps({"name": "Admin Renamed"}))
+assert api("GET", "user", token=token).get("name") == "Admin Renamed"
 
-    assert ssh_key.startswith("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI"), f"invalid ssh-key: {ssh_key}"
+api("GET", "user/keys/permissions", token=token)
+api("GET", "user/sessions", token=token)
+api("GET", "user/audit-log", token=token)
+api("GET", "user/search?q=operator", token=token)
 
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/orgs/org_name/ssh -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+key_token = api("POST", "user/keys", token=token, body=json.dumps({
+    "name": "ci-key", "permissions": ["viewOrg"]}))
+assert key_token.startswith("GRAD"), key_token
+api("POST", "user/keys", token=token, expect_error=True,
+    body=json.dumps({"name": "ci-key", "permissions": ["viewOrg"]}))  # duplicate name
+api("POST", "user/keys", token=token, expect_error=True,
+    body=json.dumps({"name": "no-perms", "permissions": []}))  # empty permission mask
+keys = api("GET", "user/keys", token=token)
+key_id = next(k["id"] for k in keys if k["name"] == "ci-key")
+# The created key authorizes API calls just like a session token.
+api("GET", "orgs", token=key_token)
+api("POST", f"user/keys/{key_id}/revoke", token=token)
+api("DELETE", "user/keys", token=token, body=json.dumps({"name": "ci-key"}))
 
-    assert req.get("error") == False, req.get("message")
+# ── Phase 3: organizations (direct + CLI) ─────────────────────────────────────
+banner("Phase 3: organizations")
+org_id = api("PUT", "orgs", token=token, body=json.dumps({
+    "name": "myorg", "display_name": "My Org", "description": "desc"}))
+api("PUT", "orgs", token=token, expect_error=True, body=json.dumps({
+    "name": "myorg", "display_name": "Dup", "description": "d"}))  # duplicate name
+assert api("GET", "orgs/myorg", token=token)["id"] == org_id
+orgs = api("GET", "orgs", token=token)["items"]
+assert any(o["id"] == org_id for o in orgs)
+api("GET", "orgs/available", token=token)
+api("GET", "orgs/public", token=token)
+api("PATCH", "orgs/myorg", token=token, body=json.dumps({"display_name": "My Org 2"}))
+assert api("GET", "orgs/myorg", token=token)["display_name"] == "My Org 2"
 
-    new_ssh_key = req.get("message")
+ssh_key = api("GET", "orgs/myorg/ssh", token=token)
+assert ssh_key.startswith("ssh-ed25519 "), ssh_key
+assert api("POST", "orgs/myorg/ssh", token=token) != ssh_key, "ssh key should rotate"
 
-    assert new_ssh_key != ssh_key, "Should have new ssh key"
+api("GET", "orgs/myorg/users", token=token)
+api("GET", "orgs/myorg/subscribe", token=token)
 
-    print(f"New SSH Key: {new_ssh_key}")
+role_id = api("POST", "orgs/myorg/roles", token=token, body=json.dumps({
+    "name": "viewers", "permissions": ["viewOrg"]}))["id"]
+api("POST", "orgs/myorg/roles", token=token, expect_error=True,
+    body=json.dumps({"name": "viewers", "permissions": ["viewOrg"]}))  # duplicate name
+api("GET", "orgs/myorg/roles", token=token)
+api("GET", f"orgs/myorg/roles/{role_id}", token=token)
+api("PATCH", f"orgs/myorg/roles/{role_id}", token=token, body=json.dumps({"name": "viewers2"}))
+api("DELETE", f"orgs/myorg/roles/{role_id}", token=token)
 
-with subtest("check api /projects/{organization}/{project}"):
-    project_name = "myproject"
+# Org membership: add the second user, change their role, then remove them.
+# Members are referenced by username; "View"/"Write" are built-in roles.
+api("POST", "orgs/myorg/users", token=token,
+    body=json.dumps({"user": member, "role": "View"}))
+api("POST", "orgs/myorg/users", token=token, expect_error=True,
+    body=json.dumps({"user": member, "role": "View"}))  # already a member
+assert any(m["id"] == member for m in api("GET", "orgs/myorg/users", token=token)), "member not added"
+api("PATCH", "orgs/myorg/users", token=token,
+    body=json.dumps({"user": member, "role": "Write"}))
+api("DELETE", "orgs/myorg/users", token=token, body=json.dumps({"user": member}))
+assert not any(m["id"] == member for m in api("GET", "orgs/myorg/users", token=token)), "member not removed"
 
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/projects/org_name/project_name -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name).replace("project_name", project_name)))
+# CLI: configure, then create/list/show/delete a second org.
+machine.succeed(f"{CLI} config Server http://gradient.local")
+machine.succeed(f"{CLI} config AuthToken {token}")
+cli("organization create --name cliorg --display-name 'CLI Org' --description d")
+api("GET", "orgs/cliorg", token=token)  # CLI-created org visible via API
+cli("organization list")
+cli("organization select cliorg")
+cli("organization show")
+cli("organization delete")
+api("GET", "orgs/cliorg", token=token, expect_error=True)  # gone
+machine.succeed(f"{CLI} organization select myorg")
 
-    assert req.get("error") == False, req.get("message")
-    assert req.get("message").get("id") == project_id, "Project ID should match"
+# ── Phase 4: projects (direct + CLI) ──────────────────────────────────────────
+banner("Phase 4: projects")
+proj_id = api("PUT", "projects/myorg", token=token, body=json.dumps({
+    "name": "myproject", "display_name": "My Project", "description": "d",
+    "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}))
+api("PUT", "projects/myorg", token=token, expect_error=True, body=json.dumps({
+    "name": "myproject", "display_name": "Dup", "description": "d",
+    "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}))  # duplicate name
+api("PUT", "projects/myorg", token=token, expect_error=True, body=json.dumps({
+    "name": "build-request", "display_name": "Reserved", "description": "d",
+    "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}))  # reserved name
+assert api("GET", "projects/myorg/myproject", token=token)["id"] == proj_id
+assert any(p["id"] == proj_id for p in api("GET", "projects/myorg", token=token)["items"])
+api("GET", "projects/myorg/available", token=token)
+api("GET", "projects/myorg/myproject/details", token=token)
+api("PATCH", "projects/myorg/myproject", token=token, body=json.dumps({"display_name": "MP2"}))
+api("GET", "projects/myorg/myproject/entry-points", token=token)
+api("GET", "projects/myorg/myproject/metrics", token=token)
+assert api("GET", "projects/myorg/myproject/evaluations", token=token) == [], \
+    "fresh project should have no evaluations"
 
-with subtest("check api /orgs/{organization}/workers"):
-    # Register a worker under the org
-    req = json.loads(machine.succeed("""
-        curl -XPOST http://localhost:3000/api/v1/orgs/org_name/workers -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json' -d '{"worker_id": "test-worker-001"}'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+api("POST", "projects/myorg/myproject/triggers", token=token, body=json.dumps({
+    "config": {"type": "polling", "interval_secs": 3600}}))
+api("GET", "projects/myorg/myproject/triggers", token=token)
 
-    assert req.get("error") == False, req.get("message")
-    worker_reg = req.get("message")
-    peer_id = worker_reg.get("peer_id")
-    token = worker_reg.get("token")
-    assert peer_id is not None, "peer_id should be present"
-    assert token is not None and len(token) > 0, "token should be non-empty"
-    assert len(token) == 64, f"Expected 64-char base64 token (48 bytes), got {len(token)}: {token}"
-    print(f"Worker registered: peer_id={peer_id}")
+api("GET", "projects/myorg/myproject/actions", token=token)
+api("POST", "projects/myorg/myproject/active", token=token)   # enable
+api("DELETE", "projects/myorg/myproject/active", token=token)  # disable
+# These reach out to / depend on a completed evaluation or return non-JSON
+# (SVG badge); just confirm the endpoints respond rather than asserting a body.
+machine.execute(f"curl -sS -X POST -H 'Authorization: Bearer {token}' {API}/projects/myorg/myproject/check-repository")
+machine.execute(f"curl -sS -H 'Authorization: Bearer {token}' {API}/projects/myorg/myproject/flake-inputs")
+machine.execute(f"curl -sS -H 'Authorization: Bearer {token}' {API}/projects/myorg/myproject/badge")
 
-    # List workers - should contain our registration
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs/org_name/workers -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+# CLI: create/list/show/delete a second project under the selected org.
+machine.succeed(f"{CLI} project select myproject")
+cli("project create --name cliproject --display-name 'CLI Project' --description d "
+    "--repository git@github.com:Wavelens/Gradient.git --wildcard 'packages.*'")
+api("GET", "projects/myorg/cliproject", token=token)
+cli("project list")
+machine.succeed(f"{CLI} project select cliproject")
+cli("project show")
+cli("project delete")
+api("GET", "projects/myorg/cliproject", token=token, expect_error=True)
+machine.succeed(f"{CLI} project select myproject")
 
-    assert req.get("error") == False, req.get("message")
-    workers = req.get("message")
-    assert any(w.get("worker_id") == "test-worker-001" for w in workers), \
-        f"test-worker-001 not found in: {[w.get('worker_id') for w in workers]}"
+# Project transfer: move a throwaway project to a second org owned by the caller.
+api("PUT", "orgs", token=token, body=json.dumps({
+    "name": "destorg", "display_name": "Dest", "description": "d"}))
+api("PUT", "projects/myorg", token=token, body=json.dumps({
+    "name": "transferme", "display_name": "Transfer", "description": "d",
+    "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}))
+api("POST", "projects/myorg/transferme/transfer", token=token,
+    body=json.dumps({"organization": "destorg"}))
+api("GET", "projects/destorg/transferme", token=token)               # now under destorg
+api("GET", "projects/myorg/transferme", token=token, expect_error=True)  # gone from myorg
 
-    # Delete the worker registration
-    req = json.loads(machine.succeed("""
-        curl -XDELETE http://localhost:3000/api/v1/orgs/org_name/workers/test-worker-001 -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+# ── Phase 5: workers (direct + CLI) ───────────────────────────────────────────
+banner("Phase 5: workers")
+api_worker = "b0000000-0000-4000-8000-000000000001"
+reg = api("POST", "orgs/myorg/workers", token=token, body=json.dumps({
+    "worker_id": api_worker, "display_name": "api-worker"}))
+assert reg.get("token") and len(reg["token"]) == 64, reg
+assert any(w["worker_id"] == api_worker
+           for w in api("GET", "orgs/myorg/workers", token=token))
+api("PATCH", f"orgs/myorg/workers/{api_worker}", token=token,
+    body=json.dumps({"display_name": "api-worker-2"}))
+api("DELETE", f"orgs/myorg/workers/{api_worker}", token=token)
 
-    assert req.get("error") == False, req.get("message")
+cli_worker = "c0000000-0000-4000-8000-000000000002"
+cli(f"worker register {cli_worker} --display-name cli-worker")
+assert any(w["worker_id"] == cli_worker
+           for w in api("GET", "orgs/myorg/workers", token=token))
+cli("worker list")
+cli(f"worker delete {cli_worker}")
+assert not any(w["worker_id"] == cli_worker
+               for w in api("GET", "orgs/myorg/workers", token=token))
 
-    # Confirm deletion
-    req = json.loads(machine.succeed("""
-        curl -XGET http://localhost:3000/api/v1/orgs/org_name/workers -H 'Authorization: Bearer api_key' -H 'Content-Type: application/json'
-    """.replace("api_key", api_key).replace("org_name", org_name)))
+# ── Phase 6: caches (direct + CLI) ────────────────────────────────────────────
+banner("Phase 6: caches")
+api("PUT", "caches", token=token, body=json.dumps({
+    "name": "maincache", "display_name": "Main", "description": "d", "priority": 10}))
+api("PUT", "caches", token=token, expect_error=True, body=json.dumps({
+    "name": "maincache", "display_name": "Dup", "description": "d", "priority": 10}))  # duplicate name
+api("GET", "caches/maincache", token=token)
+assert any(c["name"] == "maincache" for c in api("GET", "caches", token=token))
+api("GET", "caches/available", token=token)
+api("GET", "caches/public", token=token)
+api("GET", "caches/maincache/public-key", token=token)
+api("GET", "caches/maincache/key", token=token)
+api("GET", "caches/maincache/stats", token=token)
+api("GET", "caches/maincache/members", token=token)
+api("GET", "caches/maincache/roles", token=token)
+api("GET", "caches/maincache/upstreams", token=token)
+api("PATCH", "caches/maincache", token=token, body=json.dumps({"priority": 20}))
+# Subscribe the org so the cache is usable in org context.
+api("POST", "orgs/myorg/subscribe/maincache", token=token)
+api("POST", "orgs/myorg/subscribe/maincache", token=token, expect_error=True)  # already subscribed
 
-    assert req.get("error") == False, req.get("message")
-    workers = req.get("message")
-    assert not any(w.get("worker_id") == "test-worker-001" for w in workers), \
-        "worker should have been deleted"
+cli("cache create --name clicache --display-name 'CLI Cache' --description d --priority 5")
+api("GET", "caches/clicache", token=token)
+cli("cache list")
+cli("cache show clicache")
+cli("cache delete clicache")
+api("GET", "caches/clicache", token=token, expect_error=True)
+
+# ── Phase 6b: cache sub-resources (members, roles, upstreams, subscription) ───
+banner("Phase 6b: cache members / roles / upstreams")
+# Members (second user, by username; "View"/"Write" are built-in cache roles).
+api("POST", "caches/maincache/members", token=token,
+    body=json.dumps({"user": member, "role": "View"}))
+api("POST", "caches/maincache/members", token=token, expect_error=True,
+    body=json.dumps({"user": member, "role": "View"}))  # already a member
+assert any(m["id"] == member for m in api("GET", "caches/maincache/members", token=token)), \
+    "cache member not added"
+api("PATCH", "caches/maincache/members", token=token,
+    body=json.dumps({"user": member, "role": "Write"}))
+api("DELETE", "caches/maincache/members", token=token, body=json.dumps({"user": member}))
+assert not any(m["id"] == member for m in api("GET", "caches/maincache/members", token=token)), \
+    "cache member not removed"
+
+# Custom cache role lifecycle.
+crole_id = api("POST", "caches/maincache/roles", token=token, body=json.dumps({
+    "name": "cacheviewers", "permissions": ["viewCache"]}))["id"]
+api("POST", "caches/maincache/roles", token=token, expect_error=True,
+    body=json.dumps({"name": "cacheviewers", "permissions": ["viewCache"]}))  # duplicate name
+api("GET", f"caches/maincache/roles/{crole_id}", token=token)
+api("PATCH", f"caches/maincache/roles/{crole_id}", token=token,
+    body=json.dumps({"name": "cacheviewers2"}))
+api("DELETE", f"caches/maincache/roles/{crole_id}", token=token)
+
+# HTTP upstream lifecycle (self-contained: no second cache needed).
+up_id = api("PUT", "caches/maincache/upstreams", token=token, body=json.dumps({
+    "type": "http", "display_name": "mirror",
+    "url": "https://cache.example.com",
+    "public_key": "cache.example.com-1:" + "A" * 44}))
+assert any(u["id"] == up_id for u in api("GET", "caches/maincache/upstreams", token=token)), \
+    "upstream not created"
+api("PATCH", f"caches/maincache/upstreams/{up_id}", token=token, body=json.dumps({
+    "url": "https://mirror.example.com",
+    "public_key": "mirror.example.com-1:" + "B" * 44}))
+api("DELETE", f"caches/maincache/upstreams/{up_id}", token=token)
+
+# Org subscription removal then restore.
+api("DELETE", "orgs/myorg/subscribe/maincache", token=token)
+api("POST", "orgs/myorg/subscribe/maincache", token=token)
+
+# ── Phase 7: cache NAR upload surface (direct + CLI) ──────────────────────────
+# No nix store is needed: the endpoint validates byte length + store-path shape,
+# not NAR content, so a synthetic NAR + narinfo exercises the whole surface.
+banner("Phase 7: cache NAR upload / list / show / stats / delete")
+assert api("GET", "caches/maincache/nars", token=token)["items"] == [], "cache starts empty"
+
+cli_hash = "00000000000000000000000000000000"
+payload = "gradient-test-nar-payload"
+size = len(payload)
+machine.succeed(f"printf '%s' '{payload}' > /tmp/cli.nar")
+zero64 = "0" * 64
+machine.succeed(
+    "cat > /tmp/cli.narinfo <<'EOF'\n"
+    f"StorePath: /nix/store/{cli_hash}-test\n"
+    "URL: nar/cli.nar\n"
+    "Compression: none\n"
+    f"FileHash: sha256:{zero64}\n"
+    f"FileSize: {size}\n"
+    f"NarHash: sha256:{zero64}\n"
+    f"NarSize: {size}\n"
+    "References: \n"
+    "EOF"
+)
+cli("cache upload --nar-file /tmp/cli.nar --narinfo /tmp/cli.narinfo maincache")
+
+nars = api("GET", "caches/maincache/nars", token=token)["items"]
+assert any(n["hash"] == cli_hash for n in nars), f"uploaded NAR missing: {nars}"
+api("GET", f"caches/maincache/nars/{cli_hash}", token=token)
+api("GET", "caches/maincache/nars/stats", token=token)
+api("GET", f"caches/maincache/nars/available?hash={cli_hash}", token=token)
+cli("cache nar list maincache")
+cli(f"cache nar show maincache {cli_hash}")
+cli("cache nar stats maincache")
+
+# Second NAR via direct multipart upload.
+direct_hash = "11111111111111111111111111111111"
+machine.succeed(f"printf '%s' '{payload}' > /tmp/direct.nar")
+narinfo_json = json.dumps({
+    "store_path": f"/nix/store/{direct_hash}-test",
+    "file_hash": f"sha256:{zero64}", "file_size": size,
+    "nar_hash": f"sha256:{zero64}", "nar_size": size,
+    "references": [], "deriver": None,
+})
+machine.succeed(f"cat > /tmp/direct.narinfo.json <<'EOF'\n{narinfo_json}\nEOF")
+machine.succeed(
+    f"curl -sS --fail -X POST {API}/caches/maincache/nars "
+    f"-H 'Authorization: Bearer {token}' "
+    "-F 'narinfo=</tmp/direct.narinfo.json;type=application/json' "
+    "-F 'nar=@/tmp/direct.nar'"
+)
+nars = api("GET", "caches/maincache/nars", token=token)["items"]
+assert any(n["hash"] == direct_hash for n in nars), f"direct-uploaded NAR missing: {nars}"
+
+# Delete one via CLI, one via direct API.
+cli(f"cache nar delete maincache {cli_hash} -y")
+status("DELETE", f"caches/maincache/nars/{direct_hash}", token=token, code=204)
+remaining = api("GET", "caches/maincache/nars", token=token)["items"]
+assert not any(n["hash"] in (cli_hash, direct_hash) for n in remaining), remaining
+
+# ── Phase 7b: cache active / public toggles ───────────────────────────────────
+banner("Phase 7b: cache active / public toggles")
+api("POST", "caches/maincache/public", token=token)
+api("DELETE", "caches/maincache/public", token=token)
+api("POST", "caches/maincache/active", token=token)
+api("DELETE", "caches/maincache/active", token=token)
+
+# ── Phase 8: build-dependent endpoints (no builds present) ────────────────────
+banner("Phase 8: build-dependent endpoints respond on empty state")
+missing = "00000000-0000-0000-0000-0000000000ff"
+api("GET", f"evals/{missing}", token=token, expect_error=True)
+api("GET", f"evals/{missing}/builds", token=token, expect_error=True)
+api("GET", f"builds/{missing}", token=token, expect_error=True)
+api("GET", f"builds/{missing}/graph", token=token, expect_error=True)
+api("GET", f"commits/{missing}", token=token, expect_error=True)
+
+# ── Phase 8b: permissions (multi-actor) ───────────────────────────────────────
+# The second user logs in and acts with their own token. The built-in "View"
+# role grants read access but none of the org-management permissions, so those
+# mutations must be rejected; promotion to "Admin" then unlocks them.
+banner("Phase 8b: permissions (multi-actor)")
+team_token = api("POST", "auth/basic/login", body=json.dumps({
+    "loginname": member, "password": "SecureTest123!"}))
+assert team_token, "second-user login returned empty token"
+
+# Non-member cannot read a private org.
+api("GET", "orgs/myorg", token=team_token, expect_error=True)
+
+# Operator grants "View"; the member can read but cannot manage.
+api("POST", "orgs/myorg/users", token=token, body=json.dumps({"user": member, "role": "View"}))
+api("GET", "orgs/myorg", token=team_token)                                    # ViewOrg granted
+api("PATCH", "orgs/myorg", token=team_token, expect_error=True,
+    body=json.dumps({"display_name": "hijack"}))                              # no ManageOrgSettings
+api("PUT", "projects/myorg", token=team_token, expect_error=True, body=json.dumps({
+    "name": "sneak", "display_name": "x", "description": "d",
+    "repository": "git@github.com:Wavelens/Gradient.git", "wildcard": "packages.*"}))  # no CreateProject
+api("POST", "orgs/myorg/users", token=team_token, expect_error=True,
+    body=json.dumps({"user": "operator", "role": "View"}))                    # no ManageMembers
+api("DELETE", "orgs/myorg", token=team_token, expect_error=True)              # no DeleteOrg
+
+# Promote to "Admin": the same mutation now succeeds.
+api("PATCH", "orgs/myorg/users", token=token, body=json.dumps({"user": member, "role": "Admin"}))
+api("PATCH", "orgs/myorg", token=team_token, body=json.dumps({"display_name": "Admin Edit OK"}))
+
+# Remove the member; read access is revoked again.
+api("DELETE", "orgs/myorg/users", token=token, body=json.dumps({"user": member}))
+api("GET", "orgs/myorg", token=team_token, expect_error=True)
+
+# ── Phase 8c: admin state export (superuser) ──────────────────────────────────
+# The export endpoint mirrors the live system back into a declarative
+# `services.gradient.state` shape so operators can codify it in nix.
+banner("Phase 8c: admin state export")
+
+# Non-superuser callers are rejected.
+status("GET", "admin/state", token=token, code=403)
+
+# Elevate `operator` to superuser directly (postgres is trust-auth here). The
+# quoted heredoc keeps the reserved `"user"` table name intact.
+machine.succeed("""
+cat > /tmp/superuser.sql <<'EOF'
+UPDATE "user" SET superuser = true WHERE username = 'operator';
+EOF
+""")
+machine.succeed("su postgres -c 'psql -d gradient -f /tmp/superuser.sql'")
+
+# JSON format returns the full StateConfiguration shape with secrets redacted.
+state = api("GET", "admin/state?format=json", token=token)
+assert "operator" in state["users"], state["users"]
+assert "myorg" in state["organizations"], state["organizations"]
+assert "myproject" in state["projects"], state["projects"]
+assert "maincache" in state["caches"], state["caches"]
+assert state["organizations"]["myorg"]["private_key_file"] is None
+assert state["caches"]["maincache"]["signing_key_file"] is None
+
+# Default (nix) format renders a pasteable expression carrying the same resources.
+nix_out = machine.succeed(f"curl -sS -H 'Authorization: Bearer {token}' {API}/admin/state")
+assert nix_out.startswith("# Generated by"), nix_out
+for needle in ["myorg = {", "myproject = {", "maincache = {", "signing_key_file = null;"]:
+    assert needle in nix_out, f"missing {needle!r} in nix export:\n{nix_out}"
+
+# ── Phase 8d: declarative state apply (#347) ──────────────────────────────────
+# The server provisions `services.gradient.state` at startup. Verify every
+# resource type landed and that permissions / the API key are enforced.
+banner("Phase 8d: declarative state apply")
+
+# #349: secrets mlock without flooding the log once LimitMEMLOCK is granted.
+memlock = machine.succeed("systemctl show gradient-server -p LimitMEMLOCK --value").strip()
+assert int(memlock) >= 67108864, f"LimitMEMLOCK not raised: {memlock}"
+assert "mlock failed" not in machine.succeed("journalctl -u gradient-server --no-pager"), \
+    "mlock warnings present despite raised LimitMEMLOCK"
+
+# State user + password applied; superuser flag unlocks the admin export.
+time.sleep(8)
+sa_token = api("POST", "auth/basic/login", body=json.dumps({
+    "loginname": "stateadmin", "password": "admin_password"}))
+assert sa_token, "state admin login returned empty token"
+status("GET", "admin/state", token=sa_token, code=200)  # superuser applied
+
+org = api("GET", "orgs/stateorg", token=sa_token)
+assert org["display_name"] == "State Org" and org["description"] == "Provisioned by state", org
+
+# Membership + custom role applied (statemember holds the state-managed role).
+# The org-users list returns the role name in the `name` field.
+members = {m["id"]: m["name"] for m in api("GET", "orgs/stateorg/users", token=sa_token)}
+assert members.get("stateadmin") == "Admin", members
+assert members.get("statemember") == "releaser", members
+releaser = next(r for r in api("GET", "orgs/stateorg/roles", token=sa_token)["roles"]
+                if r["name"] == "releaser")
+assert set(releaser["permissions"]) == {"viewOrg", "triggerEvaluation"}, releaser
+
+# Project applied with its non-default fields and both triggers.
+proj = api("GET", "projects/stateorg/stateproject", token=sa_token)
+assert proj["concurrency"] == "hard_abort", proj
+assert proj["sign_cache"] is False and proj["keep_evaluations"] == 5, proj
+assert proj["wildcard"] == "packages.x86_64-linux.*", proj
+trig_types = {t["type"] for t in api("GET", "projects/stateorg/stateproject/triggers", token=sa_token)}
+assert {"polling", "time"} <= trig_types, trig_types
+
+# Cache applied with members, custom role and upstream.
+cache = api("GET", "caches/statecache", token=sa_token)
+assert cache["public"] is True and cache["priority"] == 20 and cache["max_storage_gb"] == 5, cache
+assert any(m["id"] == "statemember" for m in api("GET", "caches/statecache/members", token=sa_token))
+assert any(r["name"] == "cachereaders"
+           for r in api("GET", "caches/statecache/roles", token=sa_token)["roles"])
+assert any(u["url"] == "https://cache.nixos.org"
+           for u in api("GET", "caches/statecache/upstreams", token=sa_token))
+
+# Worker registration applied with its capability gates.
+worker = next(w for w in api("GET", "orgs/stateorg/workers", token=sa_token)
+              if w["worker_id"] == "a0000000-0000-0000-0000-0000000000aa")
+assert worker["enable_eval"] is True and worker["enable_fetch"] is False, worker
+
+# base workers (#115)
+base_id = "a0000000-0000-0000-0000-0000000000bb"
+base_id2 = "a0000000-0000-0000-0000-0000000000cc"
+
+sa_workers = api("GET", "orgs/stateorg/workers", token=sa_token)
+base = next(w for w in sa_workers if w["worker_id"] == base_id)
+assert base["is_base"] is True, base
+assert base["active"] is True, "base worker pre-enabled via organizations should be active"
+
+base2 = next(w for w in sa_workers if w["worker_id"] == base_id2)
+assert base2["is_base"] is True and base2["active"] is False, base2
+
+api("PATCH", f"orgs/stateorg/workers/{base_id2}", token=sa_token, body=json.dumps({"active": True}))
+assert next(w for w in api("GET", "orgs/stateorg/workers", token=sa_token)
+            if w["worker_id"] == base_id2)["active"] is True, "enable failed"
+api("PATCH", f"orgs/stateorg/workers/{base_id2}", token=sa_token, body=json.dumps({"active": False}))
+assert next(w for w in api("GET", "orgs/stateorg/workers", token=sa_token)
+            if w["worker_id"] == base_id2)["active"] is False, "disable failed"
+
+api("PATCH", f"orgs/stateorg/workers/{base_id}", token=sa_token, expect_error=True,
+    body=json.dumps({"display_name": "nope"}))
+api("DELETE", f"orgs/stateorg/workers/{base_id}", token=sa_token, expect_error=True)
+
+test_res = api("POST", f"orgs/stateorg/workers/{base_id}/test", token=sa_token)
+assert test_res["connected"] is False and test_res["ok"] is False, test_res
+
+# Both integration kinds applied.
+ints = {(i["name"], i["kind"]) for i in api("GET", "orgs/stateorg/integrations", token=sa_token)}
+assert ("state-inbound", "inbound") in ints and ("state-outbound", "outbound") in ints, ints
+
+# API key applied: the bearer `GRAD<raw>` authorizes, and its `viewOrg`-only
+# mask is enforced (a settings mutation is rejected).
+state_key = "GRADstatecitokenrawvalue"
+api("GET", "orgs/stateorg", token=state_key)  # viewOrg granted -> authorizes
+api("PATCH", "orgs/stateorg", token=state_key, expect_error=True,
+    body=json.dumps({"display_name": "hijack"}))  # mask lacks ManageOrgSettings
+
+# ── Phase 9: logout ───────────────────────────────────────────────────────────
+banner("Phase 9: logout")
+api("POST", "auth/logout", token=token)
+
+banner("API test PASSED")

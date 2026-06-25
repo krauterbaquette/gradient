@@ -17,6 +17,7 @@ import { OrganizationsService } from '@core/services/organizations.service';
 import { OrgAccessService } from '@core/services/org-access.service';
 import {
   AccessState,
+  CreateIntegrationRequest,
   ForgeType,
   InboundForge,
   Integration,
@@ -24,6 +25,7 @@ import {
   Organization,
 } from '@core/models';
 import { LoadingSpinnerComponent } from '@shared/components/loading-spinner/loading-spinner.component';
+import { LabelHelpComponent } from '@shared/components/form';
 import { WritableDirective, ManagedDisableDirective } from '@shared/access';
 
 interface Option<T> {
@@ -43,6 +45,7 @@ interface Option<T> {
     InputTextModule,
     SelectModule,
     LoadingSpinnerComponent,
+    LabelHelpComponent,
     WritableDirective,
     ManagedDisableDirective,
   ],
@@ -65,6 +68,13 @@ export class IntegrationsComponent implements OnInit {
   orgDisplayName = signal('');
   organization = signal<Organization | null>(null);
   integrations = signal<Integration[]>([]);
+
+  private readonly namePattern = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+
+  get nameInvalid(): boolean {
+    const n = this.formData.name.trim();
+    return n.length > 0 && !this.namePattern.test(n);
+  }
 
   showCreateDialog = signal(false);
   showEditDialog = signal(false);
@@ -94,6 +104,7 @@ export class IntegrationsComponent implements OnInit {
     secret: string;
     access_token: string;
     allowed_ips: string;
+    installation_id: string;
   } = {
     name: '',
     display_name: '',
@@ -103,28 +114,27 @@ export class IntegrationsComponent implements OnInit {
     secret: '',
     access_token: '',
     allowed_ips: '',
+    installation_id: '',
   };
 
   githubAppAvailable = computed(() => this.organization()?.github_app_available === true);
-  githubInstallationId = computed(() => this.organization()?.github_installation_id ?? null);
-  githubAppInstalled = computed(() => this.githubInstallationId() != null);
+  githubInstallations = computed(() =>
+    this.integrations().filter((i) => i.forge_type === 'github' && i.kind === 'outbound'),
+  );
+  githubAppInstalled = computed(() => this.githubInstallations().length > 0);
 
-  // GitHub is intentionally absent from these option lists: GitHub
-  // integration is provided by the server-wide GitHub App and the org's
-  // `github_installation_id`, not by per-integration rows. Allowing
-  // operators to create an inbound/outbound integration with
-  // `forge_type=github` produced a row that was ignored by the dispatch and
-  // outbound CI paths and only confused setup.
   outboundForgeOptions = computed<Option<ForgeType>[]>(() => [
     { label: 'Gitea', value: 'gitea' },
     { label: 'Forgejo', value: 'forgejo' },
     { label: 'GitLab', value: 'gitlab' },
+    { label: 'GitHub', value: 'github' },
   ]);
 
   allForgeOptions = computed<Option<ForgeType>[]>(() => [
     { label: 'Gitea', value: 'gitea' },
     { label: 'Forgejo', value: 'forgejo' },
     { label: 'GitLab', value: 'gitlab' },
+    { label: 'GitHub', value: 'github' },
   ]);
 
   ngOnInit(): void {
@@ -175,6 +185,7 @@ export class IntegrationsComponent implements OnInit {
       secret: '',
       access_token: '',
       allowed_ips: '',
+      installation_id: '',
     };
     this.errorMessage.set(null);
     this.showCreateDialog.set(true);
@@ -196,7 +207,37 @@ export class IntegrationsComponent implements OnInit {
   }
 
   createIntegration(): void {
-    if (!this.formData.name.trim()) return;
+    if (!this.formData.name.trim() || this.nameInvalid) return;
+
+    if (this.formData.forge_type === 'github') {
+      const installationId = Number(this.formData.installation_id.trim());
+      if (!Number.isInteger(installationId) || installationId <= 0) {
+        this.errorMessage.set('App installation ID must be a positive integer.');
+        return;
+      }
+      this.saving.set(true);
+      this.errorMessage.set(null);
+      const body: CreateIntegrationRequest = {
+        name: this.formData.name.trim(),
+        kind: this.formData.kind,
+        forge_type: 'github',
+        installation_id: installationId,
+        ...(this.formData.display_name.trim() ? { display_name: this.formData.display_name.trim() } : {}),
+      };
+      this.integrationsService.createOrgIntegration(this.orgName, body).subscribe({
+        next: () => {
+          this.saving.set(false);
+          this.showCreateDialog.set(false);
+          this.loadIntegrations();
+        },
+        error: (err) => {
+          this.errorMessage.set(err?.message || 'Failed to create integration.');
+          this.saving.set(false);
+        },
+      });
+      return;
+    }
+
     this.saving.set(true);
     this.errorMessage.set(null);
     const body: any = {
@@ -238,6 +279,7 @@ export class IntegrationsComponent implements OnInit {
       secret: '',
       access_token: '',
       allowed_ips: (integration.allowed_ips ?? []).join('\n'),
+      installation_id: '',
     };
     this.errorMessage.set(null);
     this.showEditDialog.set(true);
@@ -353,6 +395,12 @@ export class IntegrationsComponent implements OnInit {
   inboundUrl(integration: Integration): string {
     const forge = this.inboundForge(integration.id);
     return `${window.location.origin}/api/v1/hooks/${forge}/${this.orgName}/${integration.name}`;
+  }
+
+  requiredWebhookEvents(id: string): string {
+    return this.inboundForge(id) === 'gitlab'
+      ? 'Push, Tag push, Merge request, Comments (note), and Releases events'
+      : 'Push, Pull Request, Issue Comment, Pull Request Comment, Pull Request Review, and Release';
   }
 
   copyInboundUrl(integration: Integration): void {

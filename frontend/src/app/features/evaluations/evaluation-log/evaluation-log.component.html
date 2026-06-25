@@ -17,7 +17,7 @@
   <div class="eval-layout">
 
     <!-- ── Sidebar ──────────────────────────────────────────────── -->
-    <aside class="builds-sidebar">
+    <aside class="builds-sidebar" (focusin)="setSidebarFocus(true)" (focusout)="setSidebarFocus(false)">
 
       <div class="sidebar-breadcrumb">
         <a [routerLink]="['/organization', orgName]" class="breadcrumb-link">{{ orgDisplayName() || orgName }}</a>
@@ -65,59 +65,77 @@
 
       <div class="builds-list-header">Builds</div>
 
+      @if (sidebarSearchOpen()) {
+        <div class="sidebar-search">
+          <input
+            type="text"
+            placeholder="Search builds… (Esc to close)"
+            [value]="sidebarSearchQuery()"
+            (input)="sidebarSearchQuery.set($any($event.target).value)"
+            (keydown.escape)="closeSidebarSearch()"
+          />
+        </div>
+      }
+
       @if (visibleBuilds().length === 0) {
         <div class="no-builds">No builds yet</div>
       } @else {
-        <cdk-virtual-scroll-viewport
-          #buildsViewport
-          itemSize="36"
-          minBufferPx="360"
-          maxBufferPx="720"
-          class="builds-list"
-          (scrolledIndexChange)="onBuildsViewportScroll()"
-        >
-          <div
-            *cdkVirtualFor="let build of visibleBuilds(); trackBy: trackBuildById; let i = index"
-            class="build-item status-{{ build.status.toLowerCase() }}"
-            [class.selected]="selectedBuildId() === build.id"
-            [attr.data-build-id]="build.id"
-            (click)="selectBuild(build, true)"
-            (keydown.enter)="selectBuild(build, true)"
-            (keydown.space)="$event.preventDefault(); selectBuild(build, true)"
-            (keydown.arrowdown)="$event.preventDefault(); selectAdjacentBuild(i + 1)"
-            (keydown.arrowup)="$event.preventDefault(); selectAdjacentBuild(i - 1)"
-            [title]="build.name"
-            tabindex="0"
-            role="option"
-            [attr.aria-selected]="selectedBuildId() === build.id"
-          >
-            <span class="build-dot status-{{ build.status.toLowerCase() }}"></span>
-            <span class="build-name">{{ buildDisplayName(build.name) }}</span>
-            @if (getBuildElapsed(build)) {
-              <span class="build-elapsed" [class.build-elapsed--running]="build.status === 'Building'">{{ getBuildElapsed(build) }}</span>
-            }
-            @if ((build.status === 'Completed' || build.status === 'Substituted') && build.has_artefacts) {
-              <a
-                class="build-dl-link"
-                [routerLink]="['/organization', orgName, 'artefacts', build.id]"
-                [queryParams]="{ evalId: evaluationId }"
-                (click)="$event.stopPropagation()"
-                title="View build artefacts"
-              >
-                <span class="material-symbols-outlined">download</span>
-              </a>
-            }
-            <a
-              class="graph-link"
-              [routerLink]="['/organization', orgName, 'graph', build.id]"
-              [queryParams]="{ evalId: evaluationId }"
-              (click)="$event.stopPropagation()"
-              title="View dependency graph"
-            >
-              <span class="material-symbols-outlined">account_tree</span>
-            </a>
-          </div>
-        </cdk-virtual-scroll-viewport>
+        <div class="builds-list" (scroll)="onBuildsViewportScroll($event)">
+          @for (group of groupedBuilds(); track group.key) {
+            <div class="build-group">
+              <div class="build-group-header">
+                <span class="build-dot status-{{ group.key }}"></span>
+                {{ group.label }}
+                <span class="build-group-count">{{ group.builds.length }}</span>
+              </div>
+              @for (item of group.builds; track item.build.id) {
+                <div
+                  class="build-item status-{{ statusClass(item.build.status) }}"
+                  [class.selected]="selectedBuildId() === item.build.id"
+                  [attr.data-build-id]="item.build.id"
+                  (click)="selectBuild(item.build, true)"
+                  (keydown.enter)="selectBuild(item.build, true)"
+                  (keydown.space)="$event.preventDefault(); selectBuild(item.build, true)"
+                  (keydown.arrowdown)="$event.preventDefault(); selectAdjacentBuild(item.index + 1)"
+                  (keydown.arrowup)="$event.preventDefault(); selectAdjacentBuild(item.index - 1)"
+                  [title]="item.build.name"
+                  tabindex="0"
+                  role="option"
+                  [attr.aria-selected]="selectedBuildId() === item.build.id"
+                >
+                  <span class="build-dot status-{{ statusClass(item.build.status) }}"></span>
+                  <span class="build-name">{{ buildDisplayName(item.build.name) }}</span>
+                  @if (getBuildElapsed(item.build)) {
+                    <span class="build-elapsed" [class.build-elapsed--running]="item.build.status === 'Building'">{{ getBuildElapsed(item.build) }}</span>
+                  }
+                  @if ((item.build.status === 'Completed' || item.build.status === 'Substituted') && item.build.has_artefacts) {
+                    <a
+                      class="build-dl-link"
+                      [routerLink]="['/organization', orgName, 'artefacts', item.build.id]"
+                      [queryParams]="{ evalId: evaluationId }"
+                      (click)="$event.stopPropagation()"
+                      title="View build artefacts"
+                    >
+                      <span class="material-symbols-outlined">download</span>
+                    </a>
+                  }
+                  <a
+                    class="graph-link"
+                    [routerLink]="['/organization', orgName, 'graph', item.build.id]"
+                    [queryParams]="{ evalId: evaluationId }"
+                    (click)="$event.stopPropagation()"
+                    title="View dependency graph"
+                  >
+                    <span class="material-symbols-outlined">account_tree</span>
+                  </a>
+                </div>
+              }
+            </div>
+          }
+          @empty {
+            <div class="no-builds">No matching builds</div>
+          }
+        </div>
       }
     </aside>
 
@@ -158,7 +176,7 @@
           </div>
           <div class="info-metric">
             <span class="metric-label">Commit</span>
-            <code class="commit-hash">{{ (ev.commit || '').slice(0, 8) }}</code>
+            <code class="commit-hash" [title]="ev.commit || ''">{{ (ev.commit || '').slice(0, 8) }}</code>
           </div>
           <div class="info-metric nav-btns">
             <button pButton icon="pi pi-arrow-left" severity="secondary" size="small"
@@ -179,6 +197,15 @@
 
       <!-- Log area -->
       <div class="log-area">
+        @if (ev.status === 'Waiting' && selectedSection() !== 'messages' && selectedBuildId()) {
+          <div class="waiting-banner">
+            <span class="material-symbols-outlined">pause_circle</span>
+            <span class="waiting-banner-title">{{ waitingTitle(ev.waiting_reason) }}</span>
+            @if (ev.waiting_reason) {
+              <span class="waiting-banner-sub">{{ formatWaitingReason(ev.waiting_reason) }}</span>
+            }
+          </div>
+        }
         @if (selectedSection() === 'messages') {
           <div class="messages-panel">
             <div class="messages-panel-header">Evaluation Messages</div>
@@ -265,11 +292,52 @@
           <div class="log-container-wrapper">
             <div class="log-build-header">
               <code class="log-build-path">{{ selectedBuild()?.name }}</code>
-              <span class="status-badge status-{{ selectedBuild()?.status?.toLowerCase() }}">{{ selectedBuild()?.status }}</span>
+              @if (logLineCount() > 0) {
+                <span class="log-line-count">{{ logLineCount() }} {{ logLineCount() === 1 ? 'line' : 'lines' }}</span>
+              }
+              <span class="status-badge status-{{ statusClass(selectedBuild()?.status) }}">
+                {{ selectedBuild()?.status }}
+              </span>
             </div>
+            @if (chunkedMode() && searchOpen()) {
+              <div class="log-search-bar">
+                <input
+                  class="log-search-input"
+                  type="text"
+                  placeholder="Search log…"
+                  [value]="searchQuery()"
+                  (input)="onSearchInput($event)"
+                  (keydown.enter)="searchHits().length ? nextHit() : runSearch()"
+                  (keydown.shift.enter)="prevHit()"
+                />
+                <span class="log-search-count">
+                  @if (searchLoading()) {
+                    <i class="pi pi-spin pi-spinner"></i>
+                  } @else {
+                    {{ searchHits().length === 0 ? 0 : currentHit() + 1 }} / {{ searchTotal() }}
+                  }
+                </span>
+                <button class="log-search-btn" (click)="prevHit()" title="Previous match">↑</button>
+                <button class="log-search-btn" (click)="nextHit()" title="Next match">↓</button>
+                <button class="log-search-btn" (click)="closeSearch()" title="Close (Esc)">✕</button>
+              </div>
+            }
             <div class="log-container" #logContainer (scroll)="onLogScroll($event)">
-              @if (logHtml().toString()) {
-                <pre class="log-output" [innerHTML]="logHtml()"></pre>
+              @if (logLineCount() > 0) {
+                <div class="log-spacer" [style.height.px]="topSpacerPx()"></div>
+                <div class="log-lines">
+                  @for (ln of windowLines(); track ln.n) {
+                    <div
+                      class="log-line"
+                      [class.log-line--hl]="ln.n === highlightLine()"
+                      [attr.data-line]="ln.n"
+                    >
+                      <span class="log-gutter" (click)="selectLine(ln.n)" title="Link to line">{{ ln.n }}</span>
+                      <span class="log-line-content" [innerHTML]="ln.html"></span>
+                    </div>
+                  }
+                </div>
+                <div class="log-spacer" [style.height.px]="bottomSpacerPx()"></div>
               } @else {
                 <div class="no-log-hint">
                   <span class="material-symbols-outlined">article</span>

@@ -7,7 +7,30 @@
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 import { ApiService } from './api.service';
-import { Worker, WorkerRegistration } from '@core/models';
+import { Worker, WorkerRegistration, WorkerTestResponse } from '@core/models';
+
+export interface WorkerSamplePoint {
+  at: string;
+  cpu_usage_pct: number | null;
+  ram_free_mb: number | null;
+  ram_total_mb: number | null;
+  disk_speed_mbps: number | null;
+  network_speed_mbps: number | null;
+  assigned_jobs: number;
+  max_concurrent_builds: number;
+  state: number;
+}
+
+export interface WorkerConnectionEntry {
+  connected_at: string;
+  disconnected_at: string | null;
+}
+
+export interface WorkerMetricsResponse {
+  samples: WorkerSamplePoint[];
+  connections: WorkerConnectionEntry[];
+  jobs_dispatched: number;
+}
 
 @Injectable({ providedIn: 'root' })
 export class WorkersService {
@@ -15,6 +38,10 @@ export class WorkersService {
 
   getWorkers(org: string): Observable<Worker[]> {
     return this.api.get<Worker[]>(`orgs/${org}/workers`);
+  }
+
+  getWorkerMetrics(org: string, workerId: string): Observable<WorkerMetricsResponse> {
+    return this.api.get<WorkerMetricsResponse>(`orgs/${org}/workers/${workerId}/metrics`);
   }
 
   registerWorker(
@@ -61,5 +88,9 @@ export class WorkersService {
 
   deleteWorker(org: string, workerId: string): Observable<string> {
     return this.api.delete<string>(`orgs/${org}/workers/${workerId}`);
+  }
+
+  testWorker(org: string, workerId: string): Observable<WorkerTestResponse> {
+    return this.api.post<WorkerTestResponse>(`orgs/${org}/workers/${workerId}/test`, {});
   }
 }

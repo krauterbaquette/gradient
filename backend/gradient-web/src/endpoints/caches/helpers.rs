@@ -1,0 +1,469 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Wavelens GmbH <info@wavelens.io>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+use crate::authorization::decode_jwt;
+use crate::client_ip::resolve_client_ip;
+use crate::error::{ErrorCode, WebError, WebResult};
+use crate::helpers::OptionExt;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use base64::Engine;
+use crate::ip_allowlist::is_allowed as ip_allowed;
+use gradient_util::nix_hash::{normalize_nar_hash, strip_hash_algo};
+use gradient_sources::get_path_from_derivation_output;
+use gradient_types::*;
+use gradient_core::ServerState;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait,
+};
+use std::sync::Arc;
+use tracing::error;
+
+/// Extracts HTTP Basic Auth credentials and resolves them to a user.
+/// The password field is treated as a JWT or API key (the username is ignored).
+/// Returns `Err(forbidden)` when an API-key allowlist rejects `client_ip`.
+async fn try_authenticate_basic(
+    state: &Arc<ServerState>,
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+) -> WebResult<Option<MUser>> {
+    let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let Ok(val) = auth.to_str() else { return Ok(None) };
+    let Some(encoded) = val.strip_prefix("Basic ") else {
+        return Ok(None);
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return Ok(None);
+    };
+    let Ok(creds) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    let Some(password) = creds.split_once(':').map(|(_, p)| p.to_string()) else {
+        return Ok(None);
+    };
+    let Ok(decoded) = decode_jwt(State(Arc::clone(state)), password).await else {
+        return Ok(None);
+    };
+    if let Some(ctx) = decoded.api_key_context()
+        && !ip_allowed(client_ip, &ctx.allowed_ips)
+    {
+        return Err(WebError::forbidden_with(
+            ErrorCode::FORBIDDEN_SOURCE_IP,
+            "API key not allowed from this source IP",
+        ));
+    }
+    Ok(EUser::find_by_id(decoded.user_id())
+        .one(&state.web_db)
+        .await
+        .ok()
+        .flatten())
+}
+
+/// Returns true if `user` is allowed to read `cache`.
+/// Access is granted when the user is the cache owner, holds a direct
+/// cache-user role, or belongs to any organization that subscribes to the cache.
+async fn user_can_access_cache(state: &Arc<ServerState>, cache: &MCache, user: &MUser) -> bool {
+    if cache.created_by == user.id {
+        return true;
+    }
+
+    let direct = ECacheUser::find()
+        .filter(CCacheUser::Cache.eq(cache.id))
+        .filter(CCacheUser::User.eq(user.id))
+        .one(&state.web_db)
+        .await
+        .unwrap_or(None);
+    if direct.is_some() {
+        return true;
+    }
+
+    let org_ids: Vec<OrganizationId> = EOrganizationUser::find()
+        .filter(COrganizationUser::User.eq(user.id))
+        .all(&state.web_db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|ou| ou.organization)
+        .collect();
+
+    if org_ids.is_empty() {
+        return false;
+    }
+
+    EOrganizationCache::find()
+        .filter(COrganizationCache::Cache.eq(cache.id))
+        .filter(COrganizationCache::Organization.is_in(org_ids))
+        .one(&state.web_db)
+        .await
+        .unwrap_or(None)
+        .is_some()
+}
+
+/// Checks authorization for a private cache request.
+/// Returns `Ok(())` if the cache is public or if valid credentials grant access.
+/// Returns `Err(Unauthorized)` otherwise.
+async fn require_cache_auth(
+    state: &Arc<ServerState>,
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+    cache: &MCache,
+) -> WebResult<()> {
+    if cache.public {
+        return Ok(());
+    }
+
+    let maybe_user = try_authenticate_basic(state, headers, client_ip).await?;
+    match maybe_user {
+        Some(user) if user_can_access_cache(state, cache, &user).await => Ok(()),
+        _ => Err(WebError::unauthorized(
+            "Authentication required to access this cache".to_string(),
+        )),
+    }
+}
+
+pub(super) async fn get_nar_by_hash(
+    state: Arc<ServerState>,
+    cache: MCache,
+    hash: String,
+) -> Result<NixPathInfo, WebError> {
+    get_nar_by_hash_inner(&state, cache, hash).await
+}
+
+async fn get_nar_by_hash_inner(
+    state: &Arc<ServerState>,
+    cache: MCache,
+    hash: String,
+) -> Result<NixPathInfo, WebError> {
+    let build_output = EDerivationOutput::find()
+        .filter(
+            Condition::all()
+                .add(CDerivationOutput::IsCached.eq(true))
+                .add(CDerivationOutput::Hash.eq(hash.clone())),
+        )
+        .one(&state.web_db)
+        .await
+        .map_err(WebError::from)?;
+
+    // If there's no matching derivation_output, the requested hash may
+    // belong to a `.drv` file or other standalone store path cached via
+    // `cached_path`. Fall back to that lookup.
+    let build_output = match build_output {
+        Some(o) => o,
+        None => return get_nar_by_cached_path(state, cache, hash).await,
+    };
+
+    // Access gate: the `cached_path_signature` row for this cache proves the
+    // caller-authorised cache also holds the path (derivations are global, so
+    // there is no per-org ownership to check). Same rule as get_nar_by_cached_path.
+    let cached_path_row = ECachedPath::find()
+        .filter(CCachedPath::Hash.eq(hash.clone()))
+        .one(&state.web_db)
+        .await
+        .map_err(WebError::from)?
+        .or_not_found("CachedPath")?;
+
+    let cached_path_sig = ECachedPathSignature::find()
+        .filter(
+            Condition::all()
+                .add(CCachedPathSignature::CachedPath.eq(cached_path_row.id))
+                .add(CCachedPathSignature::Cache.eq(cache.id)),
+        )
+        .one(&state.web_db)
+        .await
+        .map_err(WebError::from)?
+        .or_not_found("Signature")?;
+
+    let signature = cached_path_sig
+        .signature
+        .or_not_found("Signature not yet computed")?;
+
+    let path = get_path_from_derivation_output(build_output.clone()).full();
+
+    // All metadata comes from the cached_path row written by the worker
+    // when it uploaded the NAR.  No daemon probe is needed.
+    let nar_hash = cached_path_row
+        .nar_hash
+        .as_deref()
+        .map(normalize_nar_hash)
+        .or_not_found("NarHash not recorded")?;
+    let nar_size = cached_path_row
+        .nar_size
+        .or_not_found("NarSize not recorded")? as u64;
+    let references =
+        gradient_db::references_for_hash(&state.web_db, &cached_path_row.hash).await?;
+    let deriver = cached_path_row.deriver.clone();
+    let ca = cached_path_row.ca.clone();
+
+    let sig = gradient_sources::full_signature_token(
+        &signature,
+        &state.config.server.serve_url,
+        &cache.name,
+    );
+
+    // file_hash / file_size live on `cached_path` (written by the worker
+    // during NarUploaded). The legacy mirror on `derivation_output` is
+    // not always populated, so don't rely on it here.
+    let file_hash = cached_path_row
+        .file_hash
+        .as_deref()
+        .map(normalize_nar_hash)
+        .or_not_found("FileHash not recorded")?;
+    let file_hash_nix32 = strip_hash_algo(&file_hash).to_string();
+    let file_size = cached_path_row
+        .file_size
+        .or_not_found("FileSize not recorded")? as u32;
+
+    Ok(NixPathInfo {
+        store_path: path,
+        url: format!("nar/{}.nar.zst", file_hash_nix32),
+        compression: "zstd".to_string(),
+        file_hash,
+        file_size,
+        nar_hash,
+        nar_size,
+        references,
+        deriver,
+        sig,
+        ca,
+    })
+}
+
+/// Narinfo lookup for store paths that aren't build outputs - notably
+/// `.drv` files. Access is gated on the signature row for `cache.id`:
+/// its existence proves the caller-authorised cache also holds the
+/// path.  All metadata comes from `cached_path` because the server
+/// local store may have GC'd the drv already.
+async fn get_nar_by_cached_path(
+    state: &Arc<ServerState>,
+    cache: MCache,
+    hash: String,
+) -> Result<NixPathInfo, WebError> {
+    let cached_path_row = ECachedPath::find()
+        .filter(CCachedPath::Hash.eq(hash.clone()))
+        .one(&state.web_db)
+        .await
+        .map_err(WebError::from)?
+        .or_not_found("Path")?;
+
+    if !cached_path_row.is_fully_cached() {
+        return Err(WebError::not_found("Path"));
+    }
+
+    let cached_path_sig = ECachedPathSignature::find()
+        .filter(
+            Condition::all()
+                .add(CCachedPathSignature::CachedPath.eq(cached_path_row.id))
+                .add(CCachedPathSignature::Cache.eq(cache.id)),
+        )
+        .one(&state.web_db)
+        .await
+        .map_err(WebError::from)?
+        .or_not_found("Signature")?;
+
+    let signature = cached_path_sig
+        .signature
+        .or_not_found("Signature not yet computed")?;
+
+    let sig = gradient_sources::full_signature_token(
+        &signature,
+        &state.config.server.serve_url,
+        &cache.name,
+    );
+
+    let file_hash = cached_path_row
+        .file_hash
+        .clone()
+        .ok_or_else(|| WebError::bad_request("Missing file hash"))?;
+    let file_size = cached_path_row
+        .file_size
+        .ok_or_else(|| WebError::bad_request("Missing file size"))? as u32;
+    let nar_hash = cached_path_row
+        .nar_hash
+        .as_deref()
+        .map(normalize_nar_hash)
+        .or_not_found("NarHash not recorded")?;
+    let nar_size = cached_path_row
+        .nar_size
+        .or_not_found("NarSize not recorded")? as u64;
+    let references =
+        gradient_db::references_for_hash(&state.web_db, &cached_path_row.hash).await?;
+    let file_hash_nix32 = strip_hash_algo(&normalize_nar_hash(&file_hash)).to_string();
+
+    Ok(NixPathInfo {
+        store_path: cached_path_row.store_path(),
+        url: format!("nar/{}.nar.zst", file_hash_nix32),
+        compression: "zstd".to_string(),
+        file_hash,
+        file_size,
+        nar_hash,
+        nar_size,
+        references,
+        deriver: cached_path_row.deriver.clone(),
+        sig,
+        ca: cached_path_row.ca.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Resolved context for a Nix cache protocol request
+// ---------------------------------------------------------------------------
+
+/// Resolved context for a Nix cache protocol request.
+///
+/// Load with [`CacheContext::load`] which:
+///  1. Looks up the cache by name
+///  2. Rejects inactive caches with `BadRequest`
+///  3. Enforces access control via `require_cache_auth`
+pub(super) struct CacheContext {
+    pub cache: MCache,
+}
+
+impl CacheContext {
+    pub(super) async fn load(
+        state: &Arc<ServerState>,
+        headers: &HeaderMap,
+        client_ip: IpAddr,
+        cache_name: String,
+    ) -> WebResult<Self> {
+        let cache = ECache::find()
+            .filter(CCache::Name.eq(cache_name))
+            .one(&state.web_db)
+            .await?
+            .or_not_found("Cache")?;
+
+        if !cache.active {
+            return Err(WebError::bad_request("Cache is disabled"));
+        }
+
+        require_cache_auth(state, headers, client_ip, &cache).await?;
+
+        Ok(Self { cache })
+    }
+}
+
+pub(super) fn cache_client_ip(
+    state: &Arc<ServerState>,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> IpAddr {
+    let peer_ip = peer
+        .map(|p| p.ip())
+        .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    resolve_client_ip(headers, peer_ip, &state.config.network.trusted_proxies)
+}
+
+/// Query extractor for the `?json` flag used by text-format cache endpoints
+/// (`nix-cache-info`, `gradient-cache-info`, `.narinfo`). Any presence of
+/// `?json` (with or without a value) selects the JSON response variant.
+#[derive(Debug, serde::Deserialize)]
+pub struct JsonFlag {
+    pub json: Option<String>,
+}
+
+impl JsonFlag {
+    pub fn is_set(&self) -> bool {
+        self.json.is_some()
+    }
+}
+
+pub async fn fetch_nar_bytes(state: &Arc<ServerState>, path_hash: &str) -> WebResult<Vec<u8>> {
+    let effective_hash =
+        crate::endpoints::caches::nar::resolve_effective_hash_db(&state.web_db, path_hash).await?;
+    state
+        .nar_storage
+        .get(&effective_hash)
+        .await
+        .map_err(|e| WebError::internal(format!("Failed to read NAR: {}", e)))?
+        .or_not_found("Path")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DeleteOutcome {
+    pub ref_counted_others: bool,
+}
+
+/// Removes a single cache's claim on a NAR. Drops the per-cache signature row,
+/// the per-cache derivation pin, and - if no other cache still holds the path -
+/// the shared `cached_path` row plus the underlying NAR blob.
+pub(super) async fn delete_nar_from_cache(
+    state: &Arc<ServerState>,
+    cache_id: CacheId,
+    hash: &str,
+) -> WebResult<(MCachedPath, DeleteOutcome)> {
+    let tx = state.web_db.inner().begin().await?;
+
+    let cached_path = ECachedPath::find()
+        .filter(CCachedPath::Hash.eq(hash))
+        .one(&tx)
+        .await?
+        .or_not_found("Nar")?;
+
+    let sig = ECachedPathSignature::find()
+        .filter(CCachedPathSignature::CachedPath.eq(cached_path.id))
+        .filter(CCachedPathSignature::Cache.eq(cache_id))
+        .one(&tx)
+        .await?
+        .or_not_found("Nar")?;
+
+    ECachedPathSignature::delete_by_id(sig.id).exec(&tx).await?;
+
+    let derivation_ids: Vec<DerivationId> = EDerivationOutput::find()
+        .filter(CDerivationOutput::Hash.eq(hash))
+        .all(&tx)
+        .await?
+        .into_iter()
+        .map(|o| o.derivation)
+        .collect();
+
+    let txn = &tx;
+    gradient_db::for_each_chunk(&derivation_ids, |chunk| async move {
+        ECacheDerivation::delete_many()
+            .filter(CCacheDerivation::Cache.eq(cache_id))
+            .filter(CCacheDerivation::Derivation.is_in(chunk))
+            .exec(txn)
+            .await
+    })
+    .await?;
+
+    let remaining = ECachedPathSignature::find()
+        .filter(CCachedPathSignature::CachedPath.eq(cached_path.id))
+        .count(&tx)
+        .await?;
+    let ref_counted_others = remaining > 0;
+
+    if !ref_counted_others {
+        EDerivationOutput::update_many()
+            .col_expr(
+                CDerivationOutput::IsCached,
+                sea_orm::sea_query::Expr::value(false),
+            )
+            .filter(CDerivationOutput::Hash.eq(hash))
+            .exec(&tx)
+            .await?;
+        ECachedPath::delete_by_id(cached_path.id).exec(&tx).await?;
+    }
+
+    tx.commit().await?;
+
+    let _ = state
+        .board_events
+        .send(gradient_types::BoardEvent::CacheChanged);
+
+    if !ref_counted_others {
+        let state_bg = Arc::clone(state);
+        let h = hash.to_string();
+        state.shutdown.spawn(async move {
+            if let Err(e) = state_bg.nar_storage.delete(&h).await {
+                error!(error = %e, hash = %h, "Failed to remove NAR from storage");
+            }
+        });
+    }
+
+    Ok((cached_path, DeleteOutcome { ref_counted_others }))
+}

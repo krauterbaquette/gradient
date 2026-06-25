@@ -65,6 +65,15 @@ export class ProjectActionsComponent implements OnInit {
       this.accessSvc.shouldDisableInput(this.access()),
   );
 
+  triggerAccess = computed(() => this.accessSvc.triggerAccess(this.access()));
+
+  triggerRowDisabled = computed(
+    () =>
+      this.testingId() !== null ||
+      this.deletingId() !== null ||
+      this.accessSvc.shouldDisableInput(this.triggerAccess()),
+  );
+
   loading = signal(true);
   saving = signal(false);
   deletingId = signal<string | null>(null);
@@ -236,6 +245,7 @@ export class ProjectActionsComponent implements OnInit {
       case 'send_mail': return 'Send Mail';
       case 'send_web_request': return 'Web Request';
       case 'forge_status_report': return 'Forge Status';
+      case 'open_pr': return 'Open PR';
     }
   }
 
@@ -244,6 +254,7 @@ export class ProjectActionsComponent implements OnInit {
       case 'send_mail': return 'pi pi-envelope';
       case 'send_web_request': return 'pi pi-globe';
       case 'forge_status_report': return 'pi pi-github';
+      case 'open_pr': return 'pi pi-code';
     }
   }
 

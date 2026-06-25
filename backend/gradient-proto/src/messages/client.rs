@@ -1,0 +1,308 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Wavelens GmbH <info@wavelens.io>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+use gradient_types::proto::{
+    BuildFailureKind, CandidateScore, EvalMessageLevel, GradientCapabilities, JobKind,
+    JobUpdateKind, QueryMode,
+};
+use rkyv::{Archive, Deserialize, Serialize};
+
+/// Messages sent from the client (worker / federated peer) to the server.
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[rkyv(derive(Debug, PartialEq))]
+pub enum ClientMessage {
+    /// First message on every connection.  The peer declares its protocol
+    /// version, capabilities, and persistent identity.  The server responds
+    /// with [`super::server::ServerMessage::AuthChallenge`].
+    InitConnection {
+        version: u16,
+        capabilities: GradientCapabilities,
+        /// Persistent peer UUID, generated on first start and stored locally.
+        id: String,
+    },
+
+    /// Response to [`super::server::ServerMessage::AuthChallenge`].
+    /// Contains per-peer tokens for each peer the worker has credentials for.
+    /// Pairs are `(peer_id, token)`.
+    AuthResponse { tokens: Vec<(String, String)> },
+
+    /// Request a new auth challenge from the server - sent when the worker
+    /// has acquired a new peer token and wants to become authorized for that
+    /// peer without reconnecting.
+    ReauthRequest,
+
+    /// Decline the connection after receiving
+    /// [`super::server::ServerMessage::InitAck`].
+    /// The peer closes the WebSocket immediately after sending this.
+    Reject { code: u16, reason: String },
+
+    /// Advertise build capacity.  Sent after a successful handshake by any
+    /// peer with the `build` capability negotiated.
+    WorkerCapabilities {
+        /// Supported architectures as Nix system strings, e.g. `"x86_64-linux"`.
+        architectures: Vec<String>,
+        /// Nix system features (e.g. `"kvm"`, `"big-parallel"`), capacity-sorted.
+        system_features: Vec<String>,
+        /// Maximum number of concurrent builds this peer accepts.
+        max_concurrent_builds: u32,
+        /// Number of logical CPUs available to the worker.
+        cpu_count: u32,
+        /// Total physical RAM in MiB.
+        ram_total_mb: u64,
+        /// Relative single-core performance score (higher is faster).
+        cpu_core_score: u32,
+    },
+
+    /// Live resource-utilisation heartbeat. Sent periodically while connected so
+    /// the scheduler can score jobs against the worker's current load.
+    WorkerMetrics {
+        cpu_usage_pct: f32,
+        ram_free_mb: u64,
+        disk_speed_mbps: Option<f32>,
+        network_speed_mbps: Option<f32>,
+    },
+
+    /// Request the full current job candidate list as a stream of
+    /// [`super::server::ServerMessage::JobListChunk`] messages.  Sent once
+    /// after the handshake to bootstrap the local candidate cache.
+    RequestJobList,
+
+    /// Stream pre-computed job scores to the server.  Sent incrementally as
+    /// the worker checks `required_paths` against its local Nix store.
+    /// `is_final: true` marks the last chunk for the current scoring pass.
+    RequestJobChunk {
+        scores: Vec<CandidateScore>,
+        is_final: bool,
+    },
+
+    /// Accept or reject a [`super::server::ServerMessage::AssignJob`].
+    AssignJobResponse {
+        job_id: String,
+        accepted: bool,
+        /// Set when `accepted` is `false`.
+        reason: Option<String>,
+    },
+
+    /// Incremental progress update for an in-flight job.
+    /// The server maps these directly to `EvaluationStatus` / `BuildStatus`.
+    JobUpdate {
+        job_id: String,
+        update: JobUpdateKind,
+    },
+
+    /// All tasks in a job completed successfully.
+    /// Results were already sent via [`ClientMessage::JobUpdate`].
+    /// Per-build resource metrics travel inline on each `JobUpdate::BuildOutput`.
+    JobCompleted { job_id: String },
+
+    /// A task in the job failed; remaining tasks are skipped.
+    JobFailed {
+        job_id: String,
+        error: String,
+        kind: BuildFailureKind,
+        /// For `BuildFailureKind::InputsUnavailable`: the required input store
+        /// paths the cache could not serve. Empty for every other kind.
+        missing_paths: Vec<String>,
+    },
+
+    /// Worker is draining - it will finish in-flight jobs then disconnect.
+    /// Server stops assigning new jobs to this peer.
+    Draining,
+
+    /// Build log lines from an in-flight task.  Fire-and-forget.
+    LogChunk {
+        job_id: String,
+        task_index: u32,
+        data: Vec<u8>,
+    },
+
+    /// Request specific store paths from the server (direct NAR mode).
+    NarRequest { job_id: String, paths: Vec<String> },
+
+    /// One chunk of a NAR being pushed from worker to server (direct mode).
+    NarPush {
+        job_id: String,
+        store_path: String,
+        /// zstd-compressed NAR data, ~4 MiB chunks.
+        data: Vec<u8>,
+        offset: u64,
+        is_final: bool,
+    },
+
+    /// Worker has finished uploading a NAR (via NarPush or presigned S3) and
+    /// reports metadata so the server can update `cached_path` / `derivation_output`.
+    NarUploaded {
+        job_id: String,
+        store_path: String,
+        /// SHA-256 hash of the compressed NAR file (`sha256:<hex>`).
+        file_hash: String,
+        /// Size in bytes of the compressed NAR file.
+        file_size: u64,
+        /// Size in bytes of the uncompressed NAR.
+        nar_size: u64,
+        /// Hash of the uncompressed NAR (`sha256:<nix32>` or SRI format).
+        nar_hash: String,
+        /// Store-path references in hash-name format (without `/nix/store/` prefix).
+        /// Empty when the worker could not query local path info.
+        references: Vec<String>,
+        /// Full deriver `.drv` path that produced this output, if known.
+        /// `None` when the worker could not query local path info or when the
+        /// path has no deriver (e.g. sources, `.drv` files themselves).
+        deriver: Option<String>,
+    },
+
+    /// Opens a push stream for `store_path`; sent before the first `NarPush`.
+    /// The worker then waits for [`super::server::ServerMessage::NarPushResume`]
+    /// to learn how many compressed bytes the server already holds, then seeks
+    /// its regenerated zstd stream to that offset before sending chunks.
+    NarStreamHeader {
+        job_id: String,
+        store_path: String,
+        /// Known uncompressed nar_size if available, else `None` (informational).
+        total_bytes: Option<u64>,
+        /// zstd identity; a mismatch on resume forces a restart from offset 0.
+        stream_token: String,
+    },
+
+    /// Pull resume: the worker already holds `received_bytes` compressed bytes
+    /// of this path's `.nar.zst` on disk and asks the server to continue the
+    /// download from that offset instead of re-sending from 0.
+    NarRequestResume {
+        job_id: String,
+        store_path: String,
+        received_bytes: u64,
+        stream_token: String,
+    },
+
+    /// Request the eval-cache SQLite blob for `fingerprint`.  The server
+    /// answers with [`super::server::ServerMessage::EvalCachePullResult`].
+    EvalCachePull { job_id: String, fingerprint: String },
+
+    /// Announce an eval-cache blob the worker wants to upload.  The server
+    /// answers with [`super::server::ServerMessage::EvalCachePushGrant`]
+    /// granting a presigned PUT, an inline stream, or `Skip`.
+    EvalCachePush {
+        job_id: String,
+        fingerprint: String,
+        size_bytes: u64,
+    },
+
+    /// One chunk of an eval-cache blob being pushed inline (local-FS fallback).
+    EvalCacheChunk {
+        job_id: String,
+        data: Vec<u8>,
+        offset: u64,
+        is_final: bool,
+    },
+
+    /// Confirms a presigned eval-cache PUT completed so the server can record
+    /// the blob for `fingerprint`.
+    EvalCachePushDone {
+        job_id: String,
+        fingerprint: String,
+        size_bytes: u64,
+    },
+
+    /// Pull-based capacity signal: worker is ready to accept one job of the
+    /// given kind.
+    ///
+    /// Sent after the handshake for each available slot (once per free eval
+    /// slot and once per free build slot).  Re-sent immediately after an
+    /// [`super::server::ServerMessage::AssignJob`] is received if the worker
+    /// still has spare capacity.  Re-sent every 10 s as a heartbeat in case
+    /// the server restarted and lost the pending request.
+    ///
+    /// The server assigns the first matching pending job directly - no scoring
+    /// round-trip needed.
+    RequestJob { kind: JobKind },
+
+    /// Request the full current job candidate list from the server.
+    /// Sent once at startup (alongside [`ClientMessage::RequestJobList`]) so
+    /// the server can send the worker its initial candidate set.  All
+    /// subsequent candidate updates arrive as delta [`super::server::ServerMessage::JobOffer`]
+    /// messages and do not require another `RequestAllCandidates`.
+    RequestAllCandidates,
+
+    /// Bulk query against the server cache.
+    ///
+    /// Server responds with [`super::server::ServerMessage::CacheStatus`].
+    /// [`QueryMode`] controls what the server returns beyond the cached flag:
+    /// - `Normal` - only paths already in the cache (no URLs).
+    /// - `Pull`   - cached paths with presigned S3 GET URLs (or `url: None` for local).
+    /// - `Push`   - all paths; uncached ones include presigned S3 PUT URLs (or `url: None`).
+    CacheQuery {
+        job_id: String,
+        paths: Vec<String>,
+        /// Defaults to [`QueryMode::Normal`] when deserialized from an older client.
+        mode: QueryMode,
+    },
+
+    /// Surface an infrastructure-level message tied to the active job's
+    /// evaluation. The server inserts a row into `evaluation_message` so
+    /// operators see transport, prefetch, or NAR-import problems directly on
+    /// the evaluation page without drilling into individual build logs.
+    ///
+    /// This is **not** meant for build compile failures or user-initiated
+    /// aborts - those are already reported via `JobFailed` and deliberately
+    /// stay out of the evaluation log.
+    EvalMessage {
+        job_id: String,
+        level: EvalMessageLevel,
+        /// Short origin tag, e.g. `"build-prefetch"` or `"nar-import"`.
+        source: String,
+        message: String,
+    },
+
+    /// Query which of the given `.drv` paths the server already has recorded in
+    /// its derivation table for the org that owns `job_id`.
+    ///
+    /// Server responds with [`super::server::ServerMessage::KnownDerivations`].
+    /// The worker uses the response to prune BFS subtrees: if a derivation is
+    /// already fully recorded on the server, there is no need to traverse its
+    /// `inputDrvs` again.
+    QueryKnownDerivations {
+        job_id: String,
+        drv_paths: Vec<String>,
+    },
+}
+
+impl ClientMessage {
+    /// Static name of the variant. Used for log messages where dumping the
+    /// full Debug-formatted message would be unsafe (e.g. `NarPush` carries
+    /// up to 64 KiB of binary chunk data).
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ClientMessage::InitConnection { .. } => "InitConnection",
+            ClientMessage::AuthResponse { .. } => "AuthResponse",
+            ClientMessage::ReauthRequest => "ReauthRequest",
+            ClientMessage::Reject { .. } => "Reject",
+            ClientMessage::WorkerCapabilities { .. } => "WorkerCapabilities",
+            ClientMessage::WorkerMetrics { .. } => "WorkerMetrics",
+            ClientMessage::RequestJobList => "RequestJobList",
+            ClientMessage::RequestJobChunk { .. } => "RequestJobChunk",
+            ClientMessage::AssignJobResponse { .. } => "AssignJobResponse",
+            ClientMessage::JobUpdate { .. } => "JobUpdate",
+            ClientMessage::JobCompleted { .. } => "JobCompleted",
+            ClientMessage::JobFailed { .. } => "JobFailed",
+            ClientMessage::Draining => "Draining",
+            ClientMessage::LogChunk { .. } => "LogChunk",
+            ClientMessage::NarRequest { .. } => "NarRequest",
+            ClientMessage::NarStreamHeader { .. } => "NarStreamHeader",
+            ClientMessage::NarRequestResume { .. } => "NarRequestResume",
+            ClientMessage::NarPush { .. } => "NarPush",
+            ClientMessage::NarUploaded { .. } => "NarUploaded",
+            ClientMessage::EvalCachePull { .. } => "EvalCachePull",
+            ClientMessage::EvalCachePush { .. } => "EvalCachePush",
+            ClientMessage::EvalCacheChunk { .. } => "EvalCacheChunk",
+            ClientMessage::EvalCachePushDone { .. } => "EvalCachePushDone",
+            ClientMessage::RequestJob { .. } => "RequestJob",
+            ClientMessage::RequestAllCandidates => "RequestAllCandidates",
+            ClientMessage::CacheQuery { .. } => "CacheQuery",
+            ClientMessage::EvalMessage { .. } => "EvalMessage",
+            ClientMessage::QueryKnownDerivations { .. } => "QueryKnownDerivations",
+        }
+    }
+}

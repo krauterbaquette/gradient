@@ -131,7 +131,7 @@ AuthResponse {
 
 The server validates each token independently. The worker is authorized for every peer whose token is valid. If some tokens fail, the connection continues with the successful peers - only a total failure causes `Reject`.
 
-When validating peer tokens, the server additionally checks each authorized peer that is an organization against the `organization_cache` table. If the organization has no subscribed cache, that peer is moved into `failed_peers` with reason `"organization has no cache subscribed"`. If this leaves the authorized peer set empty, the connection is rejected with `401 no valid peer tokens provided`.
+When validating peer tokens, the server additionally checks each authorized peer that is an organization against the `organization_cache` table. If the organization has no subscribed cache, that peer is moved into `failed_peers` with reason `"organization has no cache subscribed"`. If this leaves the authorized peer set empty - i.e. the worker authenticated but every peer it presented a valid token for lacks a cache - the connection is rejected with the dedicated `495 organization has no cache subscribed` rather than a misleading `401`. A `401 no valid peer tokens provided` is only sent when no token validated at all.
 
 What authorization means depends on the peer type:
  - **Org** - worker receives jobs from that org's projects
@@ -202,8 +202,13 @@ WorkerCapabilities {
     architectures: Vec<String>,         // Nix system strings, e.g. ["x86_64-linux", "aarch64-linux"]
     system_features: Vec<String>,       // Nix system features, e.g. ["kvm", "big-parallel"]
     max_concurrent_builds: u32,         // how many parallel builds this worker accepts
+    cpu_count: u32,                     // logical CPUs available to the worker
+    ram_total_mb: u64,                  // total physical RAM in MiB
+    cpu_core_score: u32,                // relative single-core performance (higher is faster)
 }
 ```
+
+The static hardware fields (`cpu_count`, `ram_total_mb`, `cpu_core_score`) are reported once with the capabilities and feed the scheduler's resource-aware scoring rules.
 
 Architectures are free-form strings (e.g. `"x86_64-linux"`, `"aarch64-linux"`) - not an enum. Custom or unusual platforms (e.g. `"riscv64-linux"`) can be advertised without any code changes.
 
@@ -258,6 +263,21 @@ The server's handler processes mid-connection `WorkerCapabilities` identically t
 
 Re-sending `WorkerCapabilities` does **not** require reconnecting and does **not** interrupt in-flight jobs. Only future job offers are affected.
 
+### Live Metrics Heartbeat
+
+While `WorkerCapabilities` carries the worker's *static* hardware profile, `WorkerMetrics` is a periodic heartbeat carrying its *current* resource utilisation. The scheduler stores the latest report per worker and feeds it into resource-aware scoring rules so jobs prefer workers with spare capacity.
+
+```rust
+WorkerMetrics {
+    cpu_usage_pct: f32,                 // current CPU load, 0.0-100.0
+    ram_free_mb: u64,                   // currently free RAM in MiB
+    disk_speed_mbps: Option<f32>,       // measured build-dir disk throughput (MB/s), if known
+    network_speed_mbps: Option<f32>,    // measured worker<->server throughput (Mbps), if known
+}
+```
+
+The server replaces the previous values immediately on each heartbeat; a worker that never reports metrics is scored against zeroed dynamic fields (its static caps still apply). The reference worker emits `WorkerMetrics` on its ~10 s heartbeat tick, sampling host load off the dispatch thread. `disk_speed_mbps` and `network_speed_mbps` are passive EWMAs: disk from per-build cgroup `io.stat` over build wall-time, network from real NAR transfer bytes over time. Both stay `None` until the first build / NAR transfer.
+
 ### Ephemeral Workers
 
 Workers can run in ephemeral VMs (e.g. RAM-only, no persistent disk). To prevent resource leaks and state accumulation, workers can decide internally when to stop accepting work (e.g. after N jobs, or based on memory pressure). When ready to recycle, the worker sends `Draining`, waits for in-flight jobs to finish, then disconnects cleanly. The VM can then be destroyed and a fresh one spawned.
@@ -285,6 +305,12 @@ The server treats `Draining` as "do not assign new jobs to this worker". The wor
 ## Job Dispatch
 
 Job dispatch uses **eager push + pull-based claiming**. The server pushes **new** job candidates to eligible workers as they become available. Workers keep all received candidates in memory, score them against the local Nix store, and send back only **new or changed** scores. The server also keeps all scores in memory per worker. Both sides maintain a persistent view of the candidate/score state, enabling efficient delta-based communication and seamless recovery after server restarts.
+
+The "new candidates available" signal is a level-triggered `watch` generation counter (`Scheduler::job_notify`) bumped on every enqueue, so a bump fired while a session is busy serving NAR/job traffic is still observed on its next loop iteration - an edge-triggered `Notify` would drop it and starve deep build chains of `JobOffer`s.
+
+`build_dispatch_loop` runs on a 5s timer but is also kicked reactively (`Scheduler::dispatch_kick`, `notify_one`) when a job completes **and leaves its worker idle**, so the dependents it unblocks are enqueued and offered immediately. Without this, a serial dependency chain (e.g. the stdenv bootstrap) advances only one level per 5s tick. The idle gate avoids redundant passes while a worker is still busy (e.g. completing 1 of 8 concurrent builds) - that worker keeps pulling on its own and the timer covers the rest.
+
+Closing the loop on the worker side: after scoring a fresh `JobOffer` the worker sends a capacity-gated `RequestJob` (not just on its 10s heartbeat). Scoring is what clears the server's rescore gate, so the worker's post-completion `RequestJob` would otherwise race ahead of its own scores, miss, and idle until the next heartbeat - collapsing a serial chain to one level per ~10s.
 
 Jobs are scoped to the worker's authorized peers - a worker only receives candidates from peers (orgs, caches) it has successfully authenticated against.
 
@@ -495,7 +521,7 @@ Fetch runs on a worker that has the `fetch` capability. The fetch step performs 
 
  1. **Clone** the repository at the specified commit using libgit2 (handles SSH keys, `git://`, `https://`).
  2. **Archive** the flake source and all locked transitive inputs into the local Nix store by running `nix flake archive --json`. This goes through the nix daemon (subprocess) so network fetching and store-write access work correctly. Returns the nix store source path (e.g. `/nix/store/xxx-source`) and all input store paths.
- 3. **Compress and push every uncached NAR** - the worker sends `CacheQuery { mode: Push }` for every fetched path. For uncached paths, it **zstd-compresses the NAR locally** and uploads via chunked `NarPush` over the WebSocket; on completion it emits `NarUploaded` with the full metadata (`file_hash`, `file_size`, `nar_size`, `nar_hash`, `references`, `deriver`). **NARs are never transmitted uncompressed.**
+ 3. **Compress and push every uncached NAR** - the worker sends `CacheQuery { mode: Push }` for every fetched path. For uncached paths, it **zstd-compresses the NAR locally** and uploads via presigned S3 PUT (S3-backed) or chunked `NarPush` (local stores); on completion it emits `NarUploaded` with the full metadata (`file_hash`, `file_size`, `nar_size`, `nar_hash`, `references`, `deriver`). A failed upload fails the evaluation. **NARs are never transmitted uncompressed.**
  4. **Report `FetchResult`** carrying only the archived flake source store path (not the full input list - the server already has every `cached_path` row from the `NarUploaded` stream). The server hands this path to any subsequent eval-only job via `FlakeSource::Cached { store_path }`.
 
 If `nix flake archive` fails (e.g. network unavailable), the worker falls back to the temporary git checkout path, skips step 3 (nothing to push), and sets `flake_source` to `None` to signal the fallback - no follow-up eval-only job can then use `FlakeSource::Cached`.
@@ -518,7 +544,7 @@ FetchResult {
 
 The worker assembles the archive command as:
 
-```
+```text
 nix flake archive [--override-input <name> <ref>]... --json <flake-ref>
 ```
 
@@ -538,7 +564,7 @@ pub struct FlakeInputOverride {
 Every `.drv` file discovered during `EvaluateDerivations` is a cacheable store path that substituters ask for by `<drv-hash>.narinfo`. The eval worker therefore:
 
  1. Runs `CacheQuery { mode: Push, paths: <new drv paths in wave> }` alongside each `EvalResult` batch.
- 2. For uncached drvs, reads the `.drv` file from the local store, packs it into a NAR, **zstd-compresses it**, and uploads via chunked `NarPush` followed by `NarUploaded`.
+ 2. For uncached drvs, reads the `.drv` file from the local store, packs it into a NAR, **zstd-compresses it**, and uploads via presigned S3 PUT or chunked `NarPush`, followed by `NarUploaded`. A failed upload fails the evaluation.
 
 The server records the drv's `cached_path` row directly from the `NarUploaded` message. The server never re-packs or re-hashes - it trusts the NAR metadata the worker reports.
 
@@ -652,7 +678,7 @@ The flow for getting any store path (fetched flake input, evaluated `.drv`, or b
  1. **Worker produces** the path locally (fetch, eval, or build).
  2. **Worker zstd-compresses** the NAR. The compressed stream is the only form in which a NAR is ever transmitted or stored.
  3. **Worker uploads** the compressed NAR via `NarPush` (local mode) or S3 PUT (cloud mode), then sends a single `NarUploaded` carrying `file_hash`, `file_size`, `nar_size`, `nar_hash`, `references`, and `deriver` (the full `.drv` path, when the daemon knows one). `nar_hash` and `nar_size` are computed locally over the uncompressed NAR; `file_hash` and `file_size` over the compressed stream. `references` is read from the local nix-daemon via harmonia's `DaemonStore::query_path_info` (no subprocess) - for build outputs this is the runtime reference set scanned out of the NAR; for `.drv` and fetched-source paths it's whatever the daemon records.
- 4. **Server commits atomically on `NarUploaded`**: in local mode it pops the buffered `NarPush` chunks, validates the buffer length against the reported `file_size`, writes the compressed bytes to `nar_storage`, and **only then** records `cached_path` metadata (including `references` as a space-separated hash-name string in the `cached_path.references` column, and `deriver` in `cached_path.deriver` when the worker supplied one). If the size check fails or `nar_storage.put` errors, the server sends `AbortJob` and the build is marked failed - no `cached_path` row ever claims bytes that aren't actually stored. In S3 mode there are no buffered chunks; the worker uploaded directly to object storage and `NarUploaded` only records metadata. No local re-packing, re-compression, or re-hashing ever happens.
+ 4. **Server commits atomically on `NarUploaded`**: in local mode it pops the buffered `NarPush` chunks, validates the buffer length against the reported `file_size`, writes the compressed bytes to `nar_storage`, and **only then** records `cached_path` metadata (including `references` as a space-separated hash-name string in the `cached_path.references` column, and `deriver` in `cached_path.deriver` when the worker supplied one). If the size check fails or `nar_storage.put` errors, the server stops the worker and marks the build `FailedTransient` so the dispatcher re-queues it (bounded by the attempt cap); the WebSocket connection is left intact so the worker's other in-flight jobs continue. No `cached_path` row ever claims bytes that aren't actually stored. In S3 mode there are no buffered chunks; the worker uploaded directly to object storage and `NarUploaded` only records metadata. No local re-packing, re-compression, or re-hashing ever happens.
  5. **Signing** is deferred. `mark_nar_stored` inserts one `cached_path_signature` row per org-cache with `signature = NULL`. A background sweep (`cache::cacher::sign_sweep`, ticking every 60 s) finds NULL rows, reads `nar_hash` / `nar_size` / `references` from `cached_path`, computes the narinfo fingerprint, and fills in the signature. New org ↔ cache subscriptions also enqueue NULL rows for every existing `cached_path` the org owns, so the same sweep back-fills signatures without any extra code path.
 
 The server does **not** use `ensure_path` or GC roots. All cached content lives in the NAR store (S3 or local files), not in the server's Nix store.
@@ -754,7 +780,7 @@ The worker always zstd-compresses before upload - that's invariant.
 | Task | Requires | Input (from server) | Output (from worker) |
 |------|----------|---------------------|----------------------|
 | **Build** | `build` | `builds` + `required_paths` - full chain with pre-computed closure | Per-build `BuildOutput` via `JobUpdate` |
-| **Compress + Upload** | `build` | (implicit) | zstd-compressed NAR uploaded via `NarPush` / S3 PUT, followed by `NarUploaded` carrying file/NAR metadata |
+| **Compress + Upload** | `build` | (implicit) | the worker sends `CacheQuery { mode: Push }` for the realised outputs and uploads each uncached one via presigned S3 PUT (straight to object storage) or chunked `NarPush` (local stores), followed by `NarUploaded`. A failed upload fails the build transiently so the server re-queues it; on S3 the server never relays the bytes. |
 
 **NAR transfer flow:**
 
@@ -783,6 +809,8 @@ The `required_paths` were already sent in `JobCandidate` during the offer phase.
 The server pre-computes `required_paths` from the evaluation's `derivation_dependency` and `derivation_output` tables - no `.drv` parsing on either side for dependency resolution. The worker parses each `.drv` file locally to construct a `BasicDerivation` and drives the build through harmonia's `BuildDerivation` RPC against the local nix-daemon. The daemon's log stream is consumed in parallel and forwarded to the server via `LogChunk` frames so the build log is captured live.
 
 If any derivation in the chain fails, the worker skips the rest and reports `JobFailed` - the server cascades `DependencyFailed` to downstream builds.
+
+A `BuildOutput` update records each build's outputs but does **not** make the build terminal: the worker pushes the output NARs (`Compressing` / `NarUploaded`) only after the whole job's build loop, just before `JobCompleted`. The server therefore moves a build to its terminal success status (`Completed`, or `Substituted` when the daemon found the outputs already valid and ran no build) only on `JobCompleted`, after the bytes are in the cache. If it flipped to a terminal state on `BuildOutput`, a dependent could be dispatched (the dispatch gate treats `Completed`/`Substituted` as input-available) and prefetch the not-yet-uploaded output, failing `InputsUnavailable` - the regression incremental mid-eval dispatch (#392/#399) turned into a frequent eval failure. The "already valid" hint rides on the `BuildOutput`'s `substituted` flag, is persisted on `build.substituted`, and is read back at completion to pick `Substituted` vs `Completed`.
 
 ---
 
@@ -844,7 +872,8 @@ enum ClientMessage {
     AuthResponse { tokens: Vec<(String, String)> },  // [(peer_id, token), ...]
     ReauthRequest,                              // ask server to re-send AuthChallenge
     Reject { code: u16, reason: String },       // decline connection after InitAck
-    WorkerCapabilities { architectures: Vec<String>, system_features: Vec<String>, max_concurrent_builds: u32 },
+    WorkerCapabilities { architectures: Vec<String>, system_features: Vec<String>, max_concurrent_builds: u32, cpu_count: u32, ram_total_mb: u64, cpu_core_score: u32 },
+    WorkerMetrics { cpu_usage_pct: f32, ram_free_mb: u64, disk_speed_mbps: Option<f32>, network_speed_mbps: Option<f32> },
     AssignJobResponse { job_id: Uuid, accepted: bool, reason: Option<String> },
 
     // Job dispatch
@@ -855,8 +884,8 @@ enum ClientMessage {
     RequestJob { kind: JobKind },               // "I have capacity for one job" - re-sent every 10s as heartbeat
     RequestAllCandidates,                       // startup-only: ask server to re-send all active candidates once
     JobUpdate { job_id: Uuid, update: JobUpdateKind },
-    JobCompleted { job_id: Uuid },              // all tasks done; results already sent via JobUpdate
-    JobFailed { job_id: Uuid, error: String },
+    JobCompleted { job_id: Uuid },              // all tasks done; results already sent via JobUpdate. Per-build metrics travel on JobUpdate::BuildOutput
+    JobFailed { job_id: Uuid, error: String, kind: BuildFailureKind, missing_paths: Vec<String> }, // missing_paths set only for kind=InputsUnavailable
     Draining,                                   // no more jobs; finishing in-flight work then disconnecting
 
     // Streaming
@@ -917,7 +946,7 @@ evaluation that owns the active job.  The server:
 1. Looks up `active_job(job_id)` in the scheduler's job tracker.
 2. If found, resolves `PendingJob::evaluation_id()` (both eval and build
    jobs carry this) and inserts into `evaluation_message` via
-   `EvalRepo::insert_message`.
+   `db::insert_evaluation_message`.
 3. If the job is not active (already completed or evicted), the message is
    silently dropped - late infra signals for a finished job have no useful
    destination.
@@ -957,7 +986,7 @@ enum JobUpdateKind {
 
     // BuildJob phases → BuildStatus
     Building { build_id: Uuid },                        // → Building (per derivation in chain)
-    BuildOutput { build_id: Uuid, outputs: Vec<BuildOutput> }, // per-derivation result
+    BuildOutput { build_id: Uuid, outputs: Vec<BuildOutput>, metrics: Option<BuildMetrics> }, // per-build result + per-build resource usage
     Compressing,                                        // packing outputs into zstd NARs (no DB status change)
 }
 
@@ -976,7 +1005,22 @@ struct BuildProduct {
     path: String,                       // absolute store path to the product (e.g. /nix/store/xxx-name/image.iso)
     size: Option<u64>,                  // product file size in bytes, if stat succeeded
 }
+
+// Carried per build on JobUpdate::BuildOutput. A multi-build job yields one
+// BuildOutput (and thus one metrics record) per build.
+struct BuildMetrics {
+    peak_ram_mb: Option<u64>,           // peak resident set, from cgroup memory.peak
+    cpu_time_ms: Option<u64>,           // total CPU time, from cgroup cpu.stat usage_usec
+    avg_cpu_pct: Option<f32>,           // cpu_time_ms / (build_time_ms * cpu_count) * 100
+    disk_read_bytes: Option<u64>,       // from cgroup io.stat rbytes
+    disk_write_bytes: Option<u64>,      // from cgroup io.stat wbytes
+    oom_killed: bool,                   // cgroup memory.events oom_kill > 0
+    build_time_ms: Option<u64>,         // wall-clock build duration; always set
+    peak_network_mbps: Option<f32>,     // host network peak during the build window (not cgroup-attributed)
+}
 ```
+
+The worker captures `BuildMetrics` best-effort from each build's cgroup (requires Nix's experimental `use-cgroups` feature) and attaches them to that build's `BuildOutput` update. `build_time_ms` is always reported; when the cgroup cannot be located or read, the cgroup-derived fields degrade to `None`. `peak_network_mbps` is sampled host-wide during the build window (cgroup v2 carries no per-build network counter), so it is exact only when the build is the host's sole network consumer. The server records one `derivation_metric` row per build from these metrics and persists the worker-measured `build_time_ms` onto the build. A multi-build job therefore yields one metrics record per build. `metrics` is `None` for external-cached builds and when capture is disabled; in that case no metric row is written and the wall-clock build-time fallback applies.
 
 **Mapping to database status:**
 
@@ -1094,7 +1138,7 @@ When the timeout expires, the server sends `AbortJob { reason: "timeout" }`. The
 
 Default timeouts:
 - FlakeJob (evaluation): `GRADIENT_EVALUATION_TIMEOUT` (default: 600s)
-- BuildJob: no default timeout (builds can be long-running)
+- BuildJob: `GRADIENT_BUILD_DEFAULT_TIMEOUT_SECS` (default: 3600s wall-clock) and `GRADIENT_BUILD_DEFAULT_MAX_SILENT_SECS` (default: 1800s silent-output). Per-derivation `timeout` / `maxSilent` attributes override the server defaults. Either limit set to `0` disables that check. A timeout triggers `FailedTimeout` (terminal).
 
 ---
 
@@ -1213,6 +1257,12 @@ After a successful build, the worker reads `<output>/nix-support/hydra-build-pro
 Outputs with no `hydra-build-products` file send `products: []` and have no `build_product` rows.
 
 ---
+
+## Missing-input self-heal (`InputsUnavailable`)
+
+A build's prefetch can find that a transitive input output is marked done/`Substituted` yet its NAR is absent from the cache (e.g. it was never fully uploaded, or was GC'd). The worker detects this two ways: the server's `CacheQuery` reports the path `Uncached`, or a presigned S3 download returns 404/410 (the DB row claims the object but the bucket lost it, which the server cannot see because it only signs the URL). Either way the worker reports `JobFailed { kind: InputsUnavailable, missing_paths }` listing those paths. The server purges each path's stale cache artifact: it deletes the `cached_path` row (its `cached_path_signature` rows cascade; the `derivation_output` FK is `ON DELETE SET NULL`) and clears the output's `is_cached` / `cached_path`, leaving the derivation graph intact. The failing build is terminal for this evaluation; nothing is re-queued in place. Because the output is now uncached as if it had never been built, the next evaluation reschedules and rebuilds it from scratch and succeeds. A missing path with no producing derivation (a lost source or fixed-output input) cannot be rebuilt from the graph and is logged.
+
+Preventively, `expand_substituted_closure` (`gradient-scheduler/src/eval.rs`) only marks a closure dep `Substituted` when its own `derivation_output` rows are all `is_cached = true`; a dep reached via the substitution invariant but not actually cached is inserted `Created + substitutable = true` instead, so the worker substitute-attempts it and the `SubstituteUnavailable` miss path re-queues and escalates it to a real build rather than trusting a NAR that is not there.
 
 ## DependencyFailed Cascade
 
@@ -1370,6 +1420,7 @@ On receiving `ServerMessage::Draining`, workers:
 |------|---------|
 | 400  | Malformed message or unsupported protocol version |
 | 401  | Unauthorized (missing or invalid token) |
+| 495  | Organization has no cache subscribed (incomplete server setup) |
 | 499  | Capability not negotiated for this session |
 | 498  | Job not found (e.g. AbortJob for unknown job_id) |
 | 497  | Job already assigned or completed |
@@ -1382,7 +1433,7 @@ On receiving `ServerMessage::Draining`, workers:
 
 ## Versioning
 
- - `PROTO_VERSION` (currently `1`) is incremented on breaking wire changes.
+ - `PROTO_VERSION` (currently `2`) is incremented on breaking wire changes.
  - Server accepts any `client_version == PROTO_VERSION`.
  - New capabilities are gated by `GradientCapabilities` flags, not version numbers.
 
@@ -1444,4 +1495,4 @@ To prevent abuse from unauthenticated callers, anonymous sessions on public cach
 
 Connections that exceed `GRADIENT_PROTO_ANON_MAX_CONNECTIONS_PER_IP` receive `503 Service Unavailable` on the HTTP upgrade. Messages that exceed the rate limit are dropped and the connection is closed.
 
-Authenticated sessions (PRIVATE caches with a valid API key) are not subject to the per-IP anonymous caps. **Every** cache-proto session — anonymous or authenticated — additionally counts against the global `/proto` connection semaphore (`GRADIENT_MAX_PROTO_CONNECTIONS`); once it is exhausted the upgrade is rejected with `503`. A session with no NAR transfer in flight is closed after 120 s of inactivity so a silent peer cannot pin a connection slot.
+Authenticated sessions (PRIVATE caches with a valid API key) are not subject to the per-IP anonymous caps. **Every** cache-proto session - anonymous or authenticated - additionally counts against the global `/proto` connection semaphore (`GRADIENT_MAX_PROTO_CONNECTIONS`); once it is exhausted the upgrade is rejected with `503`. A session with no NAR transfer in flight is closed after 120 s of inactivity so a silent peer cannot pin a connection slot.

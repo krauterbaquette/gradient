@@ -7,7 +7,7 @@
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 import { ApiService } from './api.service';
-import { Project, ProjectDetail, EntryPointSummary, Paginated } from '@core/models';
+import { Project, ProjectDetail, EntryPointSummary, EvaluationSummary, Paginated } from '@core/models';
 
 @Injectable({ providedIn: 'root' })
 export class ProjectsService {
@@ -61,6 +61,11 @@ export class ProjectsService {
     return this.api.get<EntryPointSummary[]>(url);
   }
 
+  getEvaluations(organization: string, project: string, limit?: number): Observable<EvaluationSummary[]> {
+    const q = limit ? `?limit=${limit}` : '';
+    return this.api.get<EvaluationSummary[]>(`projects/${organization}/${project}/evaluations${q}`);
+  }
+
   startEvaluation(organization: string, project: string): Observable<string> {
     return this.api.post<string>(`projects/${organization}/${project}/evaluate`);
   }
@@ -86,12 +91,12 @@ export class ProjectsService {
   }
 
   getProjectMetrics(organization: string, project: string): Observable<ProjectMetricsResponse> {
-    return this.api.get<ProjectMetricsResponse>(`projects/${organization}/${project}/metrics`);
+    return this.api.get<ProjectMetricsResponse>(`metrics/projects/${organization}/${project}/evaluations`);
   }
 
   getEntryPointMetrics(organization: string, project: string, eval_attr: string): Observable<EntryPointMetricsResponse> {
     return this.api.get<EntryPointMetricsResponse>(
-      `projects/${organization}/${project}/entry-point-metrics?eval=${encodeURIComponent(eval_attr)}`
+      `metrics/projects/${organization}/${project}/entry-point?eval=${encodeURIComponent(eval_attr)}`
     );
   }
 }
@@ -103,6 +108,7 @@ export interface ProjectMetricPoint {
   eval_time_ms: number;
   output_size_bytes: number | null;
   closure_size_bytes: number | null;
+  runtime_closure_size_bytes: number | null;
   dependencies_count: number;
 }
 
@@ -113,11 +119,13 @@ export interface ProjectMetricsResponse {
 
 export interface EntryPointMetricPoint {
   evaluation_id: string;
+  build_id: string;
   created_at: string;
   build_status: string;
   build_time_ms: number | null;
   output_size_bytes: number | null;
   closure_size_bytes: number | null;
+  runtime_closure_size_bytes: number | null;
   dependencies_count: number;
 }
 

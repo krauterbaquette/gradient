@@ -235,6 +235,7 @@ in {
           enable = true;
           serverUrl = "ws://server/proto";
           peersFile = "/etc/gradient/secrets/worker_peers";
+          settings.buildMetrics = true;
           capabilities = {
             eval  = true;
             build = true;
@@ -295,10 +296,14 @@ in {
       server.sleep(5)
       builder.wait_for_unit("gradient-worker.service")
 
-      builder.sleep(10)
-      auth_logs = builder.succeed("journalctl -u gradient-worker --no-pager -n 100")
-      assert "handshake successful" in auth_logs, \
-          f"Worker did not authenticate successfully: {auth_logs[-500:]}"
+      # On a fresh DB the server applies its full migration set before binding
+      # :3000, so the worker (capped exponential reconnect backoff) can take well
+      # over a minute to authenticate. Wait for the handshake instead of asserting
+      # once after a fixed sleep, which races the slow cold start.
+      builder.wait_until_succeeds(
+          "journalctl -u gradient-worker --no-pager | grep -q 'handshake successful'",
+          timeout=180,
+      )
       banner("Worker authenticated via state-managed registration")
 
       # ── Phase 2: seed the test git repository ─────────────────────────────
@@ -377,6 +382,9 @@ in {
           server.sleep(10)
           assert_no_server_panic(since_seconds=15)
 
+          print("  DEBUG get_project: " + server.succeed(
+              f'{CURL} -s -w " [HTTP %{{http_code}}]" -H "Authorization: Bearer {token}" {API}/projects/org/project'
+          ))
           eval_id = server.succeed(
               f'{CURL} -sf -H "Authorization: Bearer {token}" '
               f'{API}/projects/org/project | {JQ} -rj ".message.last_evaluation // empty"'
@@ -417,6 +425,25 @@ in {
       if not completed:
           j = server.succeed("journalctl -u gradient-server --no-pager --since='-900s' -n 200")
           raise Exception(f"Evaluation did not complete after 900 s:\n{j[-2000:]}")
+
+      # ── Phase 5b: the worker committed a non-empty eval cache to disk ─────
+      # Regression guard (#386): nix commits the eval-cache AttrDb only on
+      # EvalState teardown / WAL checkpoint, but the worker reads & pushes the
+      # `<fp>.sqlite` while still alive, so the file never grew past the 4096-
+      # byte SQLite header and every flake re-evaluated cold. A committed cache
+      # is >=12 KB (schema) and larger once attributes are memoised.
+      banner("Phase 5b: worker eval-cache is committed (non-empty)")
+      eval_cache_dir = "/var/lib/gradient-worker/eval-cache/eval-cache-v6"
+      builder.succeed(f"test -d {eval_cache_dir}")
+      sizes = builder.succeed(
+          f"find {eval_cache_dir} -name '*.sqlite' -printf '%s %p\\n' | sort -rn"
+      ).strip()
+      print(sizes or "(no .sqlite files)")
+      biggest = int(sizes.splitlines()[0].split()[0]) if sizes else 0
+      assert biggest > 4096, (
+          f"eval-cache never committed: largest .sqlite is {biggest} bytes "
+          f"(4096 = empty SQLite header).\n{sizes}"
+      )
 
       # ── Phase 6: extract hello's `.drv` from the eval's build list ────────
       # We hit `/evals/{id}/builds` directly with the eval_id already pinned

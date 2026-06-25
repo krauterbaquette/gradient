@@ -105,6 +105,21 @@
         description = "Display name for the organization";
       };
 
+      id = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Explicit organization UUID. When set, a freshly created
+          organization is given this id instead of a server-generated one,
+          so a worker's `peersFile` can reference it (`<id>:<token>`) in a
+          fully declarative deployment without first looking up the
+          auto-generated id. Applied on create only; the id is immutable, so
+          a value conflicting with an existing organization is rejected.
+
+          Generate one with `uuidgen`.
+        '';
+      };
+
       description = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -130,25 +145,6 @@
           organization is hidden from project listings in the web UI. The
           project still exists and continues to receive evaluations from the
           `gradient build` CLI; this is a UI-only opt-out.
-        '';
-      };
-
-      github_installation_id = mkOption {
-        type = types.nullOr types.int;
-        default = null;
-        description = ''
-          GitHub App installation id to bind this organization to. Look it up
-          from the App's "Install App" page on github.com - it's the trailing
-          number in the installation URL.
-
-          When set, the state-driven provisioner writes it on every
-          reconciliation (state wins over runtime updates). When `null`, the
-          field is left untouched on update so a webhook-recorded id survives
-          reconciliation, and is initialised to null on create.
-
-          The presence of an installation id is the org-level signal that
-          this org uses the GitHub App; outbound CI status reporting and
-          install-webhook routing both gate on it.
         '';
       };
 
@@ -257,10 +253,12 @@
         type = types.ints.positive;
         default = 1;
         description = ''
-          Number of completed evaluations to retain per project for metrics
-          and history. Older evaluations beyond this count are garbage-
-          collected. Must be at least 1; capped at runtime by the global
-          `services.gradient.settings.keepEvaluations`.
+          Number of finished evaluations to retain per project for metrics
+          and history. The most recent finished evaluations are kept regardless
+          of outcome (completed, failed, or aborted), and GC is skipped while the
+          project has an in-progress evaluation. Older evaluations beyond this
+          count are garbage-collected. Must be at least 1; capped at runtime by
+          the global `services.gradient.settings.keepEvaluations`.
         '';
       };
 
@@ -349,8 +347,9 @@
         default = [];
         description = ''
           Project actions (email notifications, outbound web requests, forge
-          status reports). Re-applying state with fewer actions removes the
-          missing ones (matched by `name` within the project).
+          status reports, pull-request automation). Re-applying state with
+          fewer actions removes the missing ones (matched by `name` within
+          the project).
 
           Token files for `send_web_request` actions must live at the systemd
           credential path
@@ -380,6 +379,20 @@
               name = "report-status";
               type = "forge_status_report";
               config = { integration = "gitea-prod"; };
+            }
+            {
+              name = "flake-lock-pr";
+              type = "open_pr";
+              config = {
+                integration = "gitea-prod";
+                generator = "flake_lock";
+                granularity = "per_input";
+                verify_gate = "build";
+                branch_pattern = "gradient/flake-lock-update/{input}";
+                title_template = "flake.lock: update {input}";
+                body_template = "Automated flake input update opened by Gradient.";
+                update_existing = true;
+              };
             }
           ]
         '';
@@ -421,17 +434,32 @@
       };
 
       forge_type = mkOption {
-        type = types.enum [ "gitea" "forgejo" "gitlab" ];
+        type = types.enum [ "gitea" "forgejo" "gitlab" "github" ];
         description = ''
           Which forge this integration targets. For inbound integrations this
           is display metadata only - a single inbound row can serve
           Gitea/Forgejo/GitLab via the forge path segment of the webhook URL.
 
-          GitHub is intentionally absent: GitHub integration rows are
-          server-managed (auto-created when the App is installed on the org)
-          and referenced from `triggers` / project `actions` by the name
-          `"github"`.
+          `github` requires `installation_id` (no secret/token/endpoint); it
+          provisions the linked GitHub App installation in place of those
+          credentials. GitHub rows are also auto-created when the App is
+          installed on the org, so a declared one is reconciled additively.
         '';
+      };
+
+      installation_id = mkOption {
+        type = types.nullOr types.int;
+        default = null;
+        description = ''
+          GitHub App installation id (trailing number in the installation URL).
+          Required when `forge_type = "github"`, ignored otherwise.
+        '';
+      };
+
+      account_login = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "GitHub account login for the installation; naming metadata only.";
       };
 
       secret_file = mkOption {
@@ -471,7 +499,6 @@
     };
   });
 
-
   triggerType = types.submodule ({ name, ... }: {
     options = {
       type = mkOption {
@@ -485,10 +512,9 @@
         description = ''
           Name of an inbound integration in the same organization that backs
           this trigger. Required for `reporter_push` and `reporter_pull_request`;
-          ignored for `polling` and `time`. Must be declared in
-          `services.gradient.state.integrations`, except for the auto-managed
-          GitHub App row, which is referenced as `"github"` and is seeded
-          automatically once the App is installed on the org.
+          ignored for `polling` and `time`. Must name an integration in
+          `services.gradient.state.integrations` or a GitHub App row auto-seeded
+          when the App is installed on the org.
         '';
       };
 
@@ -536,7 +562,7 @@
       };
 
       type = mkOption {
-        type = types.enum [ "send_mail" "send_web_request" "forge_status_report" ];
+        type = types.enum [ "send_mail" "send_web_request" "forge_status_report" "open_pr" ];
         description = "Action kind. Drives which `config` shape is expected.";
       };
 
@@ -563,6 +589,28 @@
           - `send_mail`: `{ recipients = [ "ops@example.com" ]; subject_template = null; }`
           - `send_web_request`: `{ url = "https://hooks.example.com/gradient"; token_file = "/etc/gradient/secrets/<name>-token"; }`
           - `forge_status_report`: `{ integration = "gitea-prod"; }` (name of an outbound integration in the same organization)
+          - `open_pr`: opens a pull request on the forge with the result of a
+            generator (currently `flake_lock`, which updates `flake.lock`).
+            Fields:
+            - `integration` (string): name of an outbound integration in the
+              same organization, same convention as `forge_status_report`.
+            - `generator` (string, default `"flake_lock"`): which change
+              generator produces the PR contents.
+            - `granularity` (string, default `"per_run"`): one of `"per_run"`
+              (a single PR with every input update) or `"per_input"` (one PR
+              per updated input).
+            - `verify_gate` (string, default `"build"`): one of `"none"`,
+              `"eval"` or `"build"`. Gates PR creation on the generated change
+              passing the named stage.
+            - `branch_pattern` (string, default
+              `"gradient/flake-lock-update"`): branch name the PR is opened
+              from. For `per_input` granularity it must contain the `{input}`
+              placeholder, which is substituted with each input name.
+            - `title_template` (string, optional): template for the PR title.
+            - `body_template` (string, optional): template for the PR body.
+            - `update_existing` (bool, default `true`): when an open PR for the
+              same branch already exists, force-push the new contents to it
+              instead of opening a duplicate.
 
           For `send_web_request`, omit `token_file` to send unauthenticated
           requests. When set, the token is read from the systemd credential
@@ -668,6 +716,16 @@
         '';
       };
 
+      max_storage_gb = mkOption {
+        type = types.ints.unsigned;
+        default = 0;
+        description = ''
+          Max storage for this cache in GB. When all writable caches for an
+          org have less than 10 MiB headroom, new evaluations park in Waiting.
+          0 = unlimited.
+        '';
+      };
+
       signing_key_file = mkOption {
         type = types.str;
         description = "Path to file containing the Nix cache signing key";
@@ -755,12 +813,15 @@
 
       organizations = mkOption {
         type = types.listOf types.str;
+        default = [ ];
         description = ''
           Organizations this worker is registered under. The provisioner
-          creates one <literal>worker_registration</literal> row per
+          creates one `worker_registration` row per
           (worker_id, organization) pair so the same physical worker can
           serve builds for multiple organizations from a single state
-          entry. Must list at least one organization.
+          entry. For a base worker, lists organizations to pre-enable;
+          may be empty. Non-base workers must list at least one
+          organization (enforced by the server at state-apply time).
         '';
         example = [ "acme-corp" "globex" ];
       };
@@ -791,6 +852,25 @@
         type = types.bool;
         default = true;
         description = "Server-side gate for the worker's `build` capability for this registration.";
+      };
+
+      base_worker = mkOption {
+        type = types.bool;
+        default = false;
+        description = "When true this entry is a base worker (server-level, available to every organization) rather than a per-organization registration. `organizations` then lists organizations to pre-enable.";
+      };
+
+      authorize_against = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional fixed UUID identity a base worker authenticates as, instead of the per-organization challenge. Ignored for non-base workers.";
+        example = "123e4567-e89b-12d3-a456-426614174000";
+      };
+
+      enabled = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Global enable for a base worker. When false the base worker is unavailable to every organization. Ignored for non-base workers.";
       };
     };
   });
@@ -878,6 +958,29 @@
         '';
         example = [ "viewOrg" "triggerEvaluation" ];
       };
+
+      oidc_group = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = ''
+          OIDC group claims that grant this role on login. A user whose
+          `groups` claim contains any listed group is granted this role in
+          the role's organization. Grants are additive - they never remove a
+          membership. Requires the `groups` scope on the OIDC client.
+        '';
+        example = [ "platform-team" "ops" ];
+      };
+
+      scim_group = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = ''
+          SCIM group names that grant this role. A user the IdP adds to a
+          listed SCIM group is granted this role in the role's organization.
+          Grants are additive; removal from the group removes the membership.
+        '';
+        example = [ "acme-eng" ];
+      };
     };
   });
 
@@ -926,6 +1029,14 @@
               forge_type = "gitea";
               endpoint_url = "https://gitea.example.com";
               access_token_file = "/etc/gradient/secrets/acme-gitea-token";
+              created_by = "alice";
+            };
+            acme-github-out = {
+              organization = "acme-corp";
+              kind = "outbound";
+              forge_type = "github";
+              installation_id = 12345678;
+              account_login = "acme-corp";
               created_by = "alice";
             };
           }

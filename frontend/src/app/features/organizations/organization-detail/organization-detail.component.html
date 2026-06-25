@@ -36,12 +36,7 @@
                 <p class="text-secondary">{{ project.description || 'No description' }}</p>
                 <div class="project-meta">
                   @if (project.last_evaluation_status) {
-                    <span class="eval-status-badge" [class]="getEvalStatusClass(project.last_evaluation_status)">
-                      <span class="material-symbols-outlined" [class.pulsing]="project.last_evaluation_status === 'Queued' || project.last_evaluation_status === 'Waiting'" [class.spinning]="isRunningStatus(project.last_evaluation_status) && project.last_evaluation_status !== 'Waiting' && project.last_evaluation_status !== 'Queued'">
-                        {{ getEvalStatusIcon(project.last_evaluation_status) }}
-                      </span>
-                      {{ getEvalStatusLabel(project.last_evaluation_status) }}
-                    </span>
+                    <app-eval-status-badge [status]="project.last_evaluation_status" />
                   }
                 </div>
               </div>
@@ -156,9 +151,7 @@
     <div class="form-group">
       <label for="proj-wildcard">
         Evaluation Wildcard
-        <a href="https://wavelens.github.io/gradient/usage/overview/#evaluation-wildcard" target="_blank" rel="noopener noreferrer" class="label-help" title="Learn about evaluation wildcards">
-          <span class="material-symbols-outlined">help</span>
-        </a>
+        <gr-label-help href="https://wavelens.github.io/gradient/usage/overview/#evaluation-wildcard" title="Learn about evaluation wildcards" />
       </label>
       <input
         pInputText

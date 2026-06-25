@@ -1,7 +1,7 @@
 # Tests
 
 This page documents all unit and integration tests in the Rust backend workspace
-(**393 tests** across **7 crates**). Run them with:
+(across **8 crates**, including the `score` scoring crate). Run them with:
 
 ```sh
 cargo test --workspace --tests
@@ -18,7 +18,7 @@ that replace production dependencies (nix-daemon, filesystem, WebSocket) with
 in-memory implementations. The diagram below shows how production and test code
 relate:
 
-```
+```text
                      ┌─────────────────────────────────────────┐
                      │              proto crate                │
                      │                                         │
@@ -88,7 +88,7 @@ a production trait and substitutes the real dependency with an in-memory version
 It performs a BFS from the entry-point derivation through `inputDrvs` to build
 the full closure and populates fakes.
 
-```
+```text
   test/
   ├── output          # single line: /nix/store/<hash>-hello-2.12.3.drv
   └── store/          # 951 real ATerm .drv files
@@ -97,7 +97,7 @@ the full closure and populates fakes.
       └── ...
 ```
 
-```
+```text
          load_store("test/")
                │
                v
@@ -231,7 +231,7 @@ sequenceDiagram
 
 ## `proto::scheduler::jobs` - Job Tracker
 
-**File:** `backend/proto/src/scheduler/jobs.rs`
+**File:** `backend/scheduler/src/jobs.rs`
 **Run:** `cargo test -p proto`
 
 `JobTracker` is a dual-queue (pending + active) that tracks jobs through their
@@ -239,7 +239,7 @@ lifecycle. Tests exercise the state machine directly without any async runtime.
 
 ### Job lifecycle state machine
 
-```
+```text
                      add_pending()
                           │
                           v
@@ -263,7 +263,7 @@ lifecycle. Tests exercise the state machine directly without any async runtime.
 
 ### Peer-based filtering
 
-```
+```text
   ┌─────────────────────────────────────────────────┐
   │               JobTracker                        │
   │                                                 │
@@ -297,7 +297,7 @@ lifecycle. Tests exercise the state machine directly without any async runtime.
 
 ## `proto::scheduler::worker_pool` - Worker Registry
 
-**File:** `backend/proto/src/scheduler/worker_pool.rs`
+**File:** `backend/scheduler/src/worker_pool.rs`
 **Run:** `cargo test -p proto`
 
 `WorkerPool` is an in-memory registry of connected workers with capabilities,
@@ -305,7 +305,7 @@ authorized peers, and assigned-job tracking.
 
 ### Worker lifecycle
 
-```
+```text
   register()                           unregister()
       │                                     │
       v                                     v
@@ -327,7 +327,8 @@ authorized peers, and assigned-job tracking.
 | `test_register_and_is_connected` | Register "w1": `is_connected` true, count is 1 |
 | `test_unregister_returns_assigned_jobs` | Assign 2 jobs, unregister: returns both job IDs, count drops to 0 |
 | `test_unregister_unknown_returns_empty` | Unregistering unknown worker returns empty vec |
-| `test_update_capabilities` | Set architectures/features/max_builds, verify via `all_workers()` |
+| `test_update_capabilities` | Set architectures/features/max_builds + static hardware caps, verify via `all_workers()` and `metrics_for()` |
+| `test_update_metrics_updates_view` | Live-metrics heartbeat updates the worker's `WorkerMetricsView`; static caps survive; unknown worker returns `None` |
 | `test_mark_draining` | Draining flag is reflected in `all_workers()` output |
 | `test_authorized_peers_for` | Registered peers are accessible; unknown worker returns `None` |
 | `test_update_authorized_peers` | Adding a peer via reauth expands the authorized set |
@@ -338,7 +339,7 @@ authorized peers, and assigned-job tracking.
 
 ## `proto::scheduler` - Scheduler Coordination
 
-**File:** `backend/proto/src/scheduler/scheduler_tests.rs`
+**File:** `backend/scheduler/src/scheduler_tests.rs`
 **Run:** `cargo test -p proto`
 
 Integration tests for the `Scheduler` struct, which coordinates `WorkerPool`
@@ -399,7 +400,7 @@ Tests for the `StoreFixture` itself, validating that real `.drv` files from
 
 ### Build-wave convergence
 
-```
+```text
   Wave 0 (nothing built):
     ready_to_build() → leaf nodes only (no dependencies)
        mark_built(leaves)
@@ -433,6 +434,50 @@ Tests for the `StoreFixture` itself, validating that real `.drv` files from
 
 ---
 
+## `worker::executor::build` - Per-Build Metrics
+
+**File:** `backend/worker/src/executor/build.rs`, `backend/worker/src/metrics/cgroup.rs`
+**Run:** `cargo test -p worker executor::build`
+
+Tests for best-effort per-build resource capture. The worker records wall-clock
+`build_time_ms` for every build. When `--build-metrics` is enabled, CPU time
+comes from the daemon's build result (`cpu_user + cpu_system`, read from the
+cgroup by nix before it tears the cgroup down), while peak RAM and disk I/O are
+sampled live from the build's cgroup - located via nix's
+`<state-dir>/cgroups/<uid>` map (newest entry written after the build started,
+since nix destroys the cgroup at build end). Stale map entries and idle/ambiguous
+cases degrade to `None`.
+
+| Test | What it checks |
+|------|---------------|
+| `newest_build_cgroup_ignores_entries_older_than_since` | Stale `<uid>` files (finished builds) are skipped; only an entry written at/after the build start is returned |
+| `newest_build_cgroup_none_for_missing_dir` | Returns `None` when the cgroups map dir does not exist |
+| `daemon_cpu_usec_sums_present_fields` | Sums `cpu_user`/`cpu_system`, `None` when both absent, clamps negatives to zero |
+| `raw_to_metrics_always_sets_build_time` | `None` raw still yields `build_time_ms`; cgroup fields `None`, `oom_killed` false |
+| `raw_to_metrics_handles_zero_divisors` | `build_time_ms=0` / `cpu_count=0` → `avg_cpu_pct: None` (no divide-by-zero); other fields still converted |
+| `raw_to_metrics_computes_avg_cpu_pct` | `avg_cpu_pct = cpu_time_ms / (build_time_ms * cpu_count) * 100`; `peak_network_mbps` threaded through from the host-window sampler |
+| `cgroup::*` (Phase 4a) | `parse_cpu_usage_usec`, `parse_io_stat`, `parse_oom_kill`, `parse_memory_peak`, and `read_build_cgroup` degrade gracefully on missing files/dirs |
+
+---
+
+## `worker::metrics::throughput` - Passive Throughput EWMA
+
+**File:** `backend/worker/src/metrics/throughput.rs`
+**Run:** `cargo test -p worker metrics::throughput`
+
+Tests for the thread-safe EWMA accumulators that turn real NAR transfers and
+per-build disk I/O into the `network_speed_mbps` / `disk_speed_mbps` heartbeat
+values.
+
+| Test | What it checks |
+|------|---------------|
+| `empty_is_none` | Reports `None` until the first observation |
+| `first_sample_sets_value` | First observation seeds the EWMA exactly |
+| `converges_toward_steady_state` | Repeated observations converge toward the steady-state rate |
+| `non_positive_ignored` | Zero / negative / non-finite samples are ignored |
+
+---
+
 ## `worker::executor::eval` - Evaluation Closure Walk
 
 **File:** `backend/worker/src/executor/eval.rs`
@@ -446,7 +491,7 @@ nix-daemon, filesystem, or WebSocket connection.
 
 ### Evaluation data flow (test configuration)
 
-```
+```text
   FakeDerivationResolver         FakeDrvReader
   ┌───────────────────────┐      ┌───────────────────────┐
   │ list_flake_derivations│      │ from_raw_drvs(        │
@@ -493,7 +538,7 @@ nix-daemon, filesystem, or WebSocket connection.
 
 ## `core::types::wildcard` - Evaluation Wildcard Parsing
 
-**File:** `backend/core/src/types/wildcard.rs`  
+**File:** `backend/gradient-types/src/wildcard.rs`  
 **Run:** `cargo test -p core --tests`
 
 Tests for the `Wildcard` type used in project evaluation patterns. Parsing is via `FromStr`; the inverse is `Display`. `get_eval_str()` produces the Nix attribute-set expression passed to the evaluator.
@@ -562,7 +607,7 @@ Tests for the `Wildcard` type used in project evaluation patterns. Parsing is vi
 
 ## `core::nix::url` - Repository & Flake URL Parsing
 
-**File:** `backend/core/src/nix/url.rs`  
+**File:** `backend/gradient-nix/src/url.rs`  
 **Run:** `cargo test -p core --tests`
 
 Tests for `RepositoryUrl` (stored in the database, used for display and git operations) and `NixFlakeUrl` (passed to `nix flake` commands, always includes `?rev=`).
@@ -599,12 +644,12 @@ Tests for `RepositoryUrl` (stored in the database, used for display and git oper
 
 ## `core::db::derivation` - `.drv` File Parsing
 
-**File:** `backend/core/src/db/derivation.rs`  
+**File:** `backend/gradient-db/src/derivation.rs`  
 **Run:** `cargo test -p core --tests`
 
 Tests for `parse_drv`, which parses the textual `Derive(…)` format produced by `nix derivation show`. The fixture derivation used by these tests is:
 
-```
+```text
 Derive(
   [("out","/nix/store/abc-hello","","")],
   [("/nix/store/xyz.drv",["out"])],
@@ -621,6 +666,7 @@ Derive(
 | `test_parse_full` | All fields are parsed: one output `("out", "/nix/store/abc-hello")`, one input derivation with its output names, one input source, `system = "x86_64-linux"`, `builder = "/nix/store/bash"`, two args `["-e", "/nix/store/builder.sh"]`, and `environment["name"] = "hello"` |
 | `test_required_system_features` | `required_system_features()` splits the space-separated `requiredSystemFeatures` env var into `["kvm", "big-parallel"]` |
 | `test_no_features` | A derivation with no `requiredSystemFeatures` env entry returns an empty vec from `required_system_features()` |
+| `build_meta_detects_fixed_output` | `build_meta().is_fixed_output` is true when an output carries a non-empty hash, false otherwise |
 
 ---
 
@@ -763,7 +809,7 @@ the two functions responsible for reading peer-to-token pairs from `--peers` /
 
 ### Token source precedence
 
-```
+```text
   peers_file set? ──yes──► read file contents  ──► parse lines
                   │
                   no
@@ -777,7 +823,7 @@ the two functions responsible for reading peer-to-token pairs from `--peers` /
 
 ### Line format
 
-```
+```text
   peer_id:token64    →  ("peer_id", "token64")  ✓
   *:token64          →  ("*", "token64")         ✓  (wildcard)
   # comment          →  skipped
@@ -821,7 +867,7 @@ credential kinds the server sends during a job: a UTF-8 signing key and raw SSH
 private key bytes. Both are wrapped in `SecureString`/`SecureBytes` to avoid
 accidental logging.
 
-```
+```text
   CredentialStore (Arc<Mutex<Inner>>)
   ┌───────────────────────────────────┐
   │ signing_key: Option<SecureString> │  ← UTF-8 Ed25519 secret key
@@ -855,7 +901,7 @@ Tests for `score_candidates()`, which annotates each `JobCandidate` with the
 number of its `required_paths` that are absent from the worker's local store.
 The scheduler uses this score to prefer jobs whose inputs are already cached.
 
-```
+```text
   score_candidates(candidates, store)
        │
        ├─ for each candidate:
@@ -870,6 +916,91 @@ The scheduler uses this score to prefer jobs whose inputs are already cached.
 | `score_empty_candidates` | Empty input → empty output |
 | `score_sets_missing_to_required_count` | 5 `required_paths`, none in store → `missing = 5` |
 | `score_multiple_candidates` | 3 candidates with 0, 3, and 5 required paths → correct `missing` counts and `job_id`s preserved |
+
+---
+
+## `score` - Scheduler Scoring Policies
+
+**File:** `backend/score/src/policy.rs`, `backend/score/src/context.rs`, `backend/score/src/rules/*.rs`
+**Run:** `cargo test -p score`
+
+Tests for the pluggable scheduler scoring crate: each `ScoreRule`'s individual
+contribution, the lazy `ScoringCtx` providers, and the composed `default` /
+`resource-aware` policies. See [scheduler scoring](scheduler-scoring.md).
+
+| Test | What it checks |
+|------|---------------|
+| `missing_paths_scored_zero_wins_over_unscored` / `missing_paths_fewer_missing_wins` | `MissingPathsRule`: known availability beats unknown; fewer missing paths score higher |
+| `missing_nar_size_smaller_wins` | `MissingNarSizeRule`: smaller fetch volume scores higher |
+| `builtin_rule_rewards_real_zeroes_builtin_and_lifts_archless_worker` / `builtin_rule_ignores_evals` | `BuiltinDeprioritizeRule`: real builds `+50`, `builtin` builds `0`, a `builtin` build on an arch-less worker `+100`; evals score `0` |
+| `dependency_count_more_deps_wins` / `dependency_count_zero_deps_zero_score` | `DependencyCountRule`: more deps score higher; zero deps score zero |
+| `wait_time_longer_wait_scores_higher_but_capped` | `WaitTimeRule`: bonus grows with wait, capped at one hour |
+| `reserve_rule_penalizes_fetch_worker_for_cached_eval_only` | `ReserveFetchWorkersRule`: only fetch-worker + cached-eval combo penalised |
+| `ram_overshoot_is_negative_and_scales_with_overshoot` / `higher_oom_rate_is_more_negative_for_same_overshoot` | `ResourceFitRule`: RAM overshoot penalty scales with overshoot and past OOM rate |
+| `cpu_heavy_on_strong_worker_is_positive_and_capped` / `no_samples_is_zero` / `no_metrics_is_zero` | `ResourceFitRule`: CPU-heavy bonus capped; no-op without history samples or worker metrics |
+| `local_worker_with_full_cache_gets_full_bonus` / `more_missing_paths_lowers_bonus_floored_at_zero` / `unknown_missing_count_is_zero` / `not_prefer_local_is_zero_regardless_of_missing_count` | `PreferLocalBuildRule`: full bonus on cached local worker, decays to a floor of 0, no-op without `preferLocalBuild` |
+| `busier_org_scores_more_negative` / `zero_share_and_none_score_zero` / `fair_share_overrides_wait_gradient` | `FairShareRule` (currently disabled in policy): busier org penalised; fair-share dominates the wait-time gradient |
+| `network_rule_prefers_fast_net_for_fod` / `network_rule_zero_for_non_fod` / `network_rule_zero_without_metric` | `NetworkAffinityRule`: FODs prefer faster-network workers; no-op for non-FOD or missing metric |
+| `disk_rule_prefers_fast_disk_for_heavy_build` / `disk_rule_zero_for_light_build` / `disk_rule_zero_without_history` | `DiskAffinityRule`: disk-heavy jobs prefer faster-disk workers; no-op below threshold or without history |
+| `resource_aware_prefers_fast_net_for_fod` | Composed `resource-aware` policy steers a FOD to the faster-network worker |
+| `closure_size_computed_at_most_once` / `history_not_computed_unless_read` | `ScoringCtx` lazy providers memoise and skip unread lookups |
+| `registry_selects_known_and_falls_back` | `policy_by_name` resolves known names, falls back to `resource-aware` |
+| `simple_policy_long_waiting_build_overcomes_fresh_cached` / `simple_policy_prefers_ready_over_costly` | Composed `simple` policy: anti-starvation and ready-over-costly ordering |
+
+---
+
+## `scheduler::history` - Build History Prediction
+
+**File:** `backend/scheduler/src/history.rs`
+**Run:** `cargo test -p scheduler`
+
+Tests for the closure-size-bucketed prediction that feeds `ResourceFitRule`
+and `DiskAffinityRule`: log2-MiB bucketing, neighbour-bucket widening when a
+bucket is sparse, and aggregation of peak RAM, average CPU time, disk bytes and
+OOM rate from `derivation_metric` rows.
+
+| Test | What it checks |
+|------|---------------|
+| `buckets_are_log2_of_mb` | Closure size maps to a log2-MiB bucket index |
+| `bucket_bounds_bucket0_lower_bound_is_zero` | Bucket 0's lower bound is zero |
+| `bucket_bounds_widen_by_one_bucket_each_side` | Sparse buckets widen to neighbours for more samples |
+| `empty_rows_yield_default` | No history rows yields the default (zero-sample) prediction |
+| `summarize_aggregates_peak_cpu_and_oom` | Aggregates peak RAM, avg CPU time and OOM rate across rows |
+| `summarize_aggregates_disk_bytes` | Aggregates mean per-build disk bytes (read + write) across rows |
+
+---
+
+## `core::db::closure` - Derivation Closure Helpers
+
+**File:** `backend/gradient-db/src/closure.rs`
+**Run:** `cargo test -p core --tests`
+
+Tests for the shared closure helpers (`transitive_closure_reachable`,
+`output_sizes_by_drv`, `transitive_closure_size`, `transitive_closure_sizes`)
+extracted from the web closure-graph endpoint and reused by scheduler scoring.
+`transitive_closure_sizes` sizes many roots in one batched walk (used by the
+dispatch backfill).
+
+| Test | What it checks |
+|------|---------------|
+| `sums_closure_output_sizes` | Sums coalesced output NAR sizes over the reachable closure |
+| `empty_roots_is_zero` | Empty seed set yields a zero/empty result |
+| `bulk_sizes_dedup_diamond` | Multi-root bulk sizing counts a shared (diamond) dependency once |
+
+---
+
+## `worker::metrics` - Host Metrics & CPU-Core Score
+
+**File:** `backend/worker/src/metrics/mod.rs`
+**Run:** `cargo test -p worker metrics`
+
+Tests for the host static/dynamic metrics the worker advertises, including the
+single-core speed benchmark used for `cpu_core_score`.
+
+| Test | What it checks |
+|------|---------------|
+| `cpu_core_score_in_bounds_and_positive` | Benchmarked single-core score is positive and within sane bounds |
+| `host_static_reports_nonzero` | Static host metrics (cores, total RAM) report non-zero values |
 
 ---
 
@@ -917,7 +1048,7 @@ methods for reporting job progress. Each test uses `MockProtoServer` and a
 client opens its connection (required to avoid deadlock on the single-thread
 tokio runtime).
 
-```
+```text
   JobUpdater::report_fetching()
        │
        └─► ProtoConnection::send(ClientMessage::JobUpdate {
@@ -949,7 +1080,7 @@ Tests for `push_direct()` (chunk-streaming to server) and `upload_presigned()`
 
 ### `push_direct` flow
 
-```
+```text
   push_direct(job_id, store_path, conn)
        │
        ├─ NarByteStream::new(store_path) → async byte stream
@@ -962,7 +1093,7 @@ Tests for `push_direct()` (chunk-streaming to server) and `upload_presigned()`
 
 ### `upload_presigned` flow
 
-```
+```text
   upload_presigned(job_id, store_path, url, conn)
        │
        ├─ stream NAR → HTTP PUT to presigned URL
@@ -989,7 +1120,7 @@ required by `fingerprint_path`. No nix-daemon, filesystem, or network access.
 
 ### Hash conversion pipeline
 
-```
+```text
   sign_one_path()
        │
        ├─ query_path_info() → path_info.nar_hash  (SRI format: "sha256-<base64>")
@@ -1075,7 +1206,7 @@ Tests use `RecordingJobReporter` - no real git server or WebSocket needed.
 
 ---
 
-## `core::ci::github_app` - GitHub App JWT & Webhook Verification
+## `core::forge::github_app` - GitHub App JWT & Webhook Verification
 
 | Test | What it checks |
 |------|---------------|
@@ -1127,6 +1258,7 @@ Tests use `RecordingJobReporter` - no real git server or WebSocket needed.
 | Test | What it checks |
 |------|---------------|
 | `inbound_integrations_lookup_sql_filters_kind_inbound` | Regression: the SELECT behind `inbound_integrations_by_name` must restrict to `kind = Inbound`. Without the filter, the auto-managed GitHub App's two `name = "github"` rows (inbound + outbound) collapse in the resulting HashMap and reporter triggers persist the outbound id, so the inbound webhook resolver never matches and triggers configured via state never fire. |
+| `build_reporter_pr_rejects_outbound_integration_with_kind_aware_error` | Regression (#326): a reporter trigger referencing a name that exists only as an `outbound` integration fails with a kind-aware message naming both `inbound` and `outbound`, instead of the misleading "unknown integration" raised when the name genuinely does not exist. |
 
 ---
 
@@ -1176,38 +1308,27 @@ Unit tests for `resolve_effective_hash_db`, which maps the file-hash embedded in
 
 ---
 
-## `worker::nix_eval` - Nix String Escaping
+## `worker::wildcard_walk` - Flake Output Wildcard Traversal
+
+Pure traversal driving the cursor-backed flake discovery (replaces the retired
+`eval.nix`); unit-tested against a stub attr tree.
 
 | Test | What it checks |
 |------|---------------|
-| `escape_nix_str_plain` | Plain string → unchanged |
-| `escape_nix_str_backslash` | `\` → `\\` |
-| `escape_nix_str_double_quote` | `"` → `\"` |
-| `escape_nix_str_both` | Mixed → correct ordering of escapes |
-| `escape_nix_str_empty` | Empty string → empty string |
-
----
-
-## `worker::flake` - Flake Attribute Path Utilities
-
-| Test | What it checks |
-|------|---------------|
-| `split_attr_path_simple` | `packages.x86_64-linux.hello` → 3 segments |
-| `split_attr_path_quoted_dot` | `packages."python3.12"` preserves quoted segment with dot |
-| `split_attr_path_wildcard` | `*.*` → `["*", "*"]` |
-| `split_attr_path_single_segment` | Single segment returned as-is |
-| `pattern_to_nix_list_simple` | `a.b` → `[ "a" "b" ]` |
-| `pattern_to_nix_list_unquotes_inner` | Quoted `"python3.12"` segment → outer quotes stripped in output |
-| `pattern_to_nix_list_collapses_consecutive_wildcards` | `*.*` → `[ "*" ]` (single wildcard) |
-| `pattern_to_nix_list_wildcard_then_name` | `packages.*.hello` → `[ "packages" "*" "hello" ]` |
-| `build_wildcard_nix_expr_include_only` | No `!` prefix → `include` non-empty, `exclude` empty |
-| `build_wildcard_nix_expr_exclude_only` | All `!` prefix → `include` empty, `exclude` non-empty |
-| `build_wildcard_nix_expr_mixed` | Mix → both `include` and `exclude` non-empty |
-| `partition_forwards_exact_exclusion_alongside_hash_include` | Regression: `packages.X.#,!packages.X.Y` keeps the exclusion in the eval-bound stream instead of silently dropping it |
-| `partition_filters_literal_include_named_in_exclusion` | Literal-only inputs: an `!path` exclusion removes a matching literal include from the bypass list, and `eval.nix` is not called |
-| `partition_pure_literal_passthrough` | Literal-only input with no exclusions returns the include as-is and skips `eval.nix` |
-| `partition_mixed_literal_and_wildcard_includes_with_exclusion` | Literal include bypasses `eval.nix`; wildcard include + exclusion both travel to `eval.nix` together |
-| `partition_preserves_input_order_for_eval_patterns` | Eval-bound patterns retain their input order |
+| `parse_pattern_exclude` | `!a.b.c` → `(exclude, ["a","b","c"])` |
+| `parse_pattern_include_wildcard` | `packages.*` → `(include, ["packages","*"])` |
+| `parse_pattern_quoted_segment` | Quoted `"python3.12"` keeps its inner dot in one segment |
+| `collapse_consecutive_stars` | `packages.*.*` → `packages.*` |
+| `discover_double_star_recovers_one_level` | Trailing `*` descends one extra level |
+| `discover_hash_non_recursive` | `#` matches one depth, no extra descent |
+| `discover_literal` | Exact path resolves to itself |
+| `discover_with_exclude` | Exact-path exclusion drops the matching result |
+| `discover_checks_star` | `checks.*` collects leaf derivations |
+| `discover_hash_non_last_recurses` | `#` mid-pattern recurses on the next segment |
+| `discover_hash_terminal_non_recursive` | Trailing `#` keeps only derivations at that depth |
+| `discover_star_non_last_stops_at_opaque` | `*` skips opaque typed attrsets mid-pattern |
+| `discover_trailing_star_stops_at_opaque` | Trailing `*` does not descend into opaque attrsets |
+| `discover_trailing_star_emits_derivation_child` | Trailing `*` emits a derivation child directly |
 
 ---
 
@@ -1224,6 +1345,15 @@ Unit tests for `resolve_effective_hash_db`, which maps the file-hash embedded in
 | `quote_if_needed_dotted` | `python3.12` → quoted |
 | `nix_store_path_absolute_unchanged` | Already-absolute path → returned as-is |
 | `nix_store_path_bare_prefixed` | Bare name → `/nix/store/` prefix added |
+| `no_crash_resolves_all_in_one_call` | No subprocess crash → one batch call, every attr resolves |
+| `single_crasher_among_healthy_isolates_one_error` | Crash bisection isolates the one bad attr to a per-attr error; the rest resolve (#139) |
+| `two_crashers_isolate_independently` | Two crashers each isolate to their own per-attr error; healthy attrs resolve |
+| `transient_crash_succeeds_on_retry` | A single-attr chunk that crashes once succeeds on the one retry (no per-attr error) |
+
+The crash-isolation policy (`resolve_chunk`) is driven through an injected
+`resolve_once` stub so the bisection state machine is exercised without real
+eval subprocesses. RSS recycling is parent-side via `EvalWorker::rss_bytes`
+(reads `/proc/<pid>/statm`).
 
 ---
 
@@ -1259,7 +1389,7 @@ Unit tests for `resolve_effective_hash_db`, which maps the file-hash embedded in
 
 ## `proto::scheduler::dispatch_tests` - Dispatch Loop Functions
 
-**File:** `backend/proto/src/scheduler/dispatch_tests.rs`
+**File:** `backend/scheduler/src/dispatch_tests.rs`
 **Run:** `cargo test -p proto`
 
 Integration tests for the two background dispatch functions that feed the
@@ -1271,7 +1401,7 @@ call the pending job count is asserted directly on the scheduler.
 
 ### `dispatch_queued_evals` - DB call sequence
 
-```
+```text
   dispatch_queued_evals(scheduler)
        │
        ├─ 1. EEvaluation::find().filter(status=Queued).all()       Q
@@ -1289,7 +1419,7 @@ call the pending job count is asserted directly on the scheduler.
 
 ### `dispatch_ready_builds` - DB call sequence
 
-```
+```text
   dispatch_ready_builds(scheduler)
        │
        ├─ 1. EBuild::find().from_raw_sql(ready_builds_query).all() Q
@@ -1321,7 +1451,7 @@ call the pending job count is asserted directly on the scheduler.
 
 ## `proto::scheduler::handler_tests` - Scheduler DB Handler Functions
 
-**File:** `backend/proto/src/scheduler/handler_tests.rs`
+**File:** `backend/scheduler/src/handler_tests.rs`
 **Run:** `cargo test -p proto`
 
 Integration tests for the six handler functions that the scheduler calls when
@@ -1337,7 +1467,7 @@ staged query/exec results - no real Postgres required.
 
 SeaORM 1.x on Postgres has a subtle split between two result queues:
 
-```
+```text
   append_query_results  →  consumed by SELECT, UPDATE…RETURNING, find_by_id,
                            and insert_many().exec() (Postgres uses RETURNING)
 
@@ -1353,7 +1483,7 @@ with a valid `id: Uuid`.
 
 ### Data flow through `handle_eval_result`
 
-```
+```text
   Worker sends EvalResult
        │
        v
@@ -1380,7 +1510,7 @@ with a valid `id: Uuid`.
 
 ### Cascade flow through `handle_build_job_failed`
 
-```
+```text
   handle_build_job_failed(state, build_id, error)
        │
        ├─ EBuild::find_by_id()                              Q
@@ -1433,6 +1563,7 @@ with a valid `id: Uuid`.
 | Test | Scenario | What it checks |
 |------|----------|---------------|
 | `build_output_updates_derivation_output` | Output row exists in DB | `nar_size`, `file_hash`, and `has_artefacts` fields updated via `UPDATE…RETURNING` |
+| `build_output_with_metrics_records_one_metric_row` | `BuildOutput` carries per-build `BuildMetrics` | Persists `build_time_ms` onto the build and inserts one `derivation_metric` row, plus the normal output update |
 | `build_output_missing_row_warns_not_errors` | `derivation_output` row not found | Logs a warning, returns `Ok(())` (best-effort update) |
 | `build_output_unknown_build_errors` | `build_id` not in DB | Returns `Err` (build context is required) |
 
@@ -1448,11 +1579,11 @@ with a valid `id: Uuid`.
 
 ### Group G: `abort_evaluation`
 
-Tests for `gradient_core::db::abort_evaluation`, which cascades `Aborted` to
+Tests for `gradient_ci::abort_evaluation`, which cascades `Aborted` to
 all active builds before aborting the evaluation itself.
 
 **DB call sequence:**
-```
+```text
   abort_evaluation(state, evaluation)
        │
        ├─ guard: if eval.status == Completed → return (no DB calls)
@@ -1498,7 +1629,7 @@ the spawned webhook tasks run on the `current_thread` runtime. Deliveries are
 captured by `RecordingWebhookClient` (returned alongside the state by
 `test_state_recorded`).
 
-```
+```text
   handle_build_job_completed()
          │
          ├─ update_build_status(Completed)
@@ -1565,6 +1696,35 @@ Postgres backend, which is a follow-up infrastructure task.
 
 ---
 
+## Evaluation metrics
+
+Unit tests for the per-evaluation metrics pipeline (eval-worker capture ->
+scheduler persistence + RAM routing -> board read endpoints -> frontend panel):
+
+- **Eval-stats delta aggregator** (`gradient-worker`
+  `worker_pool::eval_stats`) - `sums_totals_across_requests`,
+  `buckets_per_entry_point`, and `heap_peak_is_max_gauge_not_sum` cover diffing
+  cumulative counters per request, bucketing costs per entry-point, and treating
+  the GC heap as a max gauge rather than a sum.
+- **Per-project eval-RAM window** (`gradient-scheduler`
+  `instance::eval_history`) - `eval_history_maps_row_into_prediction` maps the
+  per-project p95 peak-RSS window row into a `HistoryPrediction`.
+- **Eval RAM-overshoot scoring** (`gradient-score` `rules::resource`) -
+  `eval_ram_overshoot_routes_to_big_ram_worker` asserts `ResourceFitRule`
+  penalises an RAM-heavy eval on a small worker so it routes to a big-RAM one.
+- **Board read endpoints** (`gradient-web` `endpoints::board`) -
+  `eval_metric_expr_known_keys_have_units` / `eval_metric_expr_unknown_is_none`
+  cover the closed metric allow-list (so `metric` can never inject SQL);
+  `flake_output_node_maps_to_graph_node` maps a `flake_output_node::Model` to the
+  `FlakeGraphNode` DTO field-for-field. The org-scoping SQL of
+  `get_expensive_evals_by_resource` and the `EvalAccessContext` auth path of
+  `get_eval_flake_graph` have no local DB harness and are covered by E2E CI.
+- **Frontend `board.service`** (`board.service.spec.ts`) -
+  `getExpensiveEvalsByResource()` and `getEvalFlakeGraph()` GET their endpoints
+  and unwrap the response array.
+
+---
+
 ## Test count summary
 
 | Crate | Runner | Count |
@@ -1609,3 +1769,15 @@ authentication flow that workers use to connect to the server:
 - Tests `POST /api/v1/orgs/{org}/workers` returns a valid 64-character base64 token
 - Tests `GET /api/v1/orgs/{org}/workers` lists the registered worker
 - Tests `DELETE /api/v1/orgs/{org}/workers/{id}` removes the registration
+
+**`gradient-eval`** - Cursor-driven flake discovery/resolution (single node, drives
+the `--eval-worker` subprocess directly over its line-delimited JSON protocol against
+a committed fixture flake):
+- Trailing `*` recovers one level (`packages.x86_64-linux.*` finds `hello`, `cowsay`,
+  and `nested.inner`); `#` is non-recursive (only `hello`, `cowsay`); an exact-path
+  `!` exclusion drops `cowsay`.
+- `resolve` returns `hello`'s `.drv`; a `throw`-ing `boom` attribute isolates as a
+  per-item error without aborting the batch (#139).
+- The lock-only `fingerprint` op returns the flake's eval-cache key, and the
+  on-disk cache is named exactly `eval-cache-v6/<fingerprint>.sqlite` - the
+  path-agreement the fleet eval-cache (#386 L3) relies on to stage/pull blobs.

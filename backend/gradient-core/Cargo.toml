@@ -1,0 +1,96 @@
+[package]
+name        = "gradient-core"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+publish     = false
+
+[lib]
+name    = "gradient_core"
+path    = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal
+gradient-entity = { workspace = true }
+gradient-migration = { workspace = true }
+gradient-types = { workspace = true }
+gradient-util = { workspace = true }
+gradient-storage = { workspace = true }
+gradient-db = { workspace = true }
+gradient-nix = { workspace = true }
+gradient-forge = { workspace = true }
+gradient-sources = { workspace = true }
+gradient-exec = { workspace = true }
+gradient-ci = { workspace = true }
+gradient-state = { workspace = true }
+
+# Workspace
+anyhow                = { workspace = true }
+async-trait           = { workspace = true }
+base64                = { workspace = true }
+blake3                = { workspace = true }
+bytes                 = { workspace = true }
+chrono                = { workspace = true }
+clap                  = { workspace = true }
+futures               = { workspace = true }
+git-url-parse         = { workspace = true }
+git2                  = { workspace = true }
+harmonia-file-nar              = { workspace = true }
+harmonia-protocol              = { workspace = true }
+harmonia-store-content-address = { workspace = true }
+harmonia-store-path            = { workspace = true }
+harmonia-store-remote          = { workspace = true }
+harmonia-utils-hash            = { workspace = true }
+hex                   = { workspace = true }
+hmac                  = { workspace = true }
+ipnet                 = { workspace = true }
+libc                  = { workspace = true }
+nix-bindings          = { workspace = true }
+num_enum              = { workspace = true }
+object_store          = { workspace = true }
+rand                  = { workspace = true }
+reqwest               = { workspace = true }
+ring                  = { workspace = true }
+rustls                = { workspace = true }
+rustls-native-certs   = { workspace = true }
+webpki-roots          = { workspace = true }
+rkyv                  = { workspace = true }
+sea-orm               = { workspace = true }
+sea-orm-migration     = { workspace = true }
+serde                 = { workspace = true }
+serde_json            = { workspace = true }
+sha2                  = { workspace = true }
+subtle                = { workspace = true }
+tempfile              = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true, features = ["process", "macros", "fs", "io-util"] }
+tokio-util            = { workspace = true, features = ["rt", "io"] }
+tracing               = { workspace = true }
+url                   = { workspace = true }
+uuid                  = { workspace = true }
+zstd                  = { workspace = true }
+
+async-compression = { workspace = true }
+async-ssh2-lite   = { workspace = true }
+cron              = { workspace = true }
+crypter           = { workspace = true }
+ed25519-compact   = { workspace = true }
+lettre            = { workspace = true }
+password-auth     = { workspace = true }
+rand_core         = { workspace = true }
+ssh-key           = { workspace = true }
+tar               = { workspace = true }
+
+[dev-dependencies]
+harmonia-file-nar = { workspace = true, features = ["test"] }
+mockall      = { workspace = true }
+gradient-test-support = { workspace = true }
+tokio-test   = { workspace = true }
+wiremock     = { workspace = true }
+zstd         = { workspace = true }
